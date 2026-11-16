@@ -1423,6 +1423,7 @@ def main():
             bottom.addWidget(self.log_edit)
             self.btn_open = QPushButton("打开输出目录")
             self.btn_open.setMinimumHeight(28)
+            self.btn_open.setMinimumWidth(110)
             self.btn_open.clicked.connect(self.open_output_dir)
             bottom.addWidget(self.btn_open)
             root.addLayout(bottom)
@@ -1783,6 +1784,10 @@ def main():
             event.accept()
 
     application = QApplication(sys.argv)
+    application.setStyleSheet(
+        "QPushButton { min-height: 26px; padding: 3px 10px; }"
+        "QLineEdit, QSpinBox, QComboBox { min-height: 22px; }"
+        "QTreeWidget, QListWidget { alternate-background-color: palette(base); }")
     window = MainWindow()
     window.show()
 
@@ -1795,7 +1800,7 @@ def main():
             try:
                 window.grab().save(shot_path)
             finally:
-                application.quit()
+                window.close()          # 走 closeEvent，等后台线程收尾后再退出
 
         QTimer.singleShot(2500, grab_and_quit)
 
@@ -1814,3 +1819,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
