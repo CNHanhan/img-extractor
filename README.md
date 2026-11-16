@@ -67,11 +67,24 @@ python qt_extractor.py --selftest
 .\dist\FirmwareExtractor.exe --selftest
 ```
 
-自检覆盖：目录名推导（7 种乱码/伪文件名场景）、测速、端到端全流程（本地 Range 服务器 + 合成 Full OTA，
-raw/zstd/bz2/xz/zero 五种 op）、1 线程与 8 线程输出一致性、取消机制、普通 zip 并行提取、
-`Content-Disposition` 兜底。结果写入 `selftest.log`，返回码 `0` 表示全部通过。
+自检覆盖（20 项）：目录名推导（7 种乱码/伪文件名场景）、镜像候选改写与不动非 lolinet 主机、
+测速、端到端全流程（本地 Range 服务器 + 合成 Full OTA，raw/zstd/bz2/xz/zero 五种 op）、
+1 线程与 8 线程输出一致性、取消机制、普通 zip 并行提取、`Content-Disposition` 兜底、
+GUI 窗口冒烟（子进程起窗口截图后退出）。结果写入 `selftest.log`，返回码 `0` 表示全部通过。
 
 ## 打包单文件 exe
+
+一条命令（推荐）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+`build.ps1` 会把依赖和打包工作区放到 **ASCII 临时目录**再构建，最后只把 exe 拷回
+`dist\FirmwareExtractor.exe`——因为 PyInstaller 的 Qt 钩子与 onefile 引导器都不认
+中文路径，直接在中文目录构建会报 `Qt plugin directory ... does not exist!`。
+
+手动等价命令（项目路径必须是纯 ASCII）：
 
 ```powershell
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
@@ -79,7 +92,8 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
   --paths libs qt_extractor.py
 ```
 
-产物：`dist/FirmwareExtractor.exe`。
+产物：`dist/FirmwareExtractor.exe`（约 57 MB）。
+PyInstaller 的产物**不是逐字节可复现**的（内嵌时间戳），请用 `--selftest` 而不是哈希来验收。
 
 ## 文件说明
 
