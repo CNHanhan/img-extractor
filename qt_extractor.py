@@ -29,7 +29,7 @@ import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit, urlunsplit
 
 import urllib3
 
@@ -50,7 +50,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -186,18 +186,8 @@ def _decode_segment(segment):
     return _fix_mojibake(unquote(segment, encoding="utf-8", errors="replace"))
 
 
-def _name_from_disposition(session, url):
-    """URL 里没有可用文件名时，向服务器要 Content-Disposition"""
-    if session is None:
-        return ""
-    try:
-        response = session.head(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        try:
-            header = response.headers.get("Content-Disposition", "")
-        finally:
-            response.close()
-    except Exception:
-        return ""
+def _name_from_cd_header(header):
+    """从 Content-Disposition 头里取文件名（支持 filename*=UTF-8''...）"""
     if not header:
         return ""
     match = re.search(r"filename\*\s*=\s*([\w\-]+)'[^']*'([^;]+)", header, re.I)
@@ -212,6 +202,55 @@ def _name_from_disposition(session, url):
     if match:
         return _fix_mojibake(match.group(1).strip())
     return ""
+
+
+def _name_from_disposition(session, url, log=None):
+    """URL 里没有可用文件名时，向服务器要 Content-Disposition。
+
+    三级兜底：
+      ① URL 查询串里的 response-content-disposition（对象存储预签名直链常这么带）
+      ② HEAD 请求的响应头
+      ③ Range: bytes=0-0 的 GET 响应头
+         （AWS SigV4 预签名链接只对 GET 签名，HEAD 会 403，只能退回 GET）
+    """
+    query = parse_qs(urlsplit(url).query)
+    for key in ("response-content-disposition", "response_content_disposition"):
+        for value in query.get(key, []):
+            name = _name_from_cd_header(value)
+            if name:
+                if log:
+                    log("文件名取自 URL 的 %s 参数: %s" % (key, name))
+                return name
+
+    if session is None:
+        return ""
+
+    header = ""
+    try:
+        response = session.head(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        try:
+            if response.status_code < 400:
+                header = response.headers.get("Content-Disposition", "")
+        finally:
+            response.close()
+    except Exception:
+        header = ""
+
+    if not header:
+        # 预签名 GET 链接用 HEAD 会签名不匹配（403），退化成 1 字节 GET 读头
+        try:
+            response = session.get(url, headers={**HEADERS, "Range": "bytes=0-0"},
+                                   timeout=(15, 30), stream=True)
+            try:
+                header = response.headers.get("Content-Disposition", "")
+            finally:
+                response.close()
+        except Exception:
+            header = ""
+        if header and log:
+            log("HEAD 取不到文件名，用 1 字节 GET 读到: %s" % _name_from_cd_header(header))
+
+    return _name_from_cd_header(header)
 
 
 def sanitize_name(name):
@@ -249,7 +288,7 @@ def derive_folder_name(url, session=None, log=None):
 
     weak = (not name) or ("." not in decoded) or (name.lower() in _FAKE_NAMES)
     if weak:
-        alt = _name_from_disposition(session, url)
+        alt = _name_from_disposition(session, url, log)
         alt = sanitize_name(strip_archive_suffix(_decode_segment(alt))) if alt else ""
         if alt and alt.lower() not in _FAKE_NAMES:
             if log:
@@ -923,6 +962,9 @@ def _build_range_handler():
             if not full:
                 self.send_error(404)
                 return
+            if os.path.basename(full).startswith("presign"):
+                self.send_error(403)      # 模拟 S3/EOS 预签名链接：HEAD 签名不匹配
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(os.path.getsize(full)))
@@ -959,6 +1001,10 @@ def _build_range_handler():
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(length))
+            if os.path.basename(full).startswith("presign"):
+                self.send_header(
+                    "Content-Disposition",
+                    "attachment; filename*=UTF-8''%E9%A2%84%E7%AD%BE%E5%90%8D.zip")
             if partial:
                 self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
             self.end_headers()
@@ -1154,6 +1200,22 @@ def run_selftest():
         session = ExtractorCore().new_session()
         got = derive_folder_name(dispatch_url, session)
         check("Content-Disposition 兜底", got == "真实名", "got=%r" % got)
+
+        # 6b) 对象存储预签名直链：文件名在 response-content-disposition 查询参数里
+        presigned = ("https://ykj-eos-dg5-01.eos-dongguan-6.cmecloud.cn/"
+                     "d97289a8a7eb408d8167a659fd6f7c48086"
+                     "?response-content-disposition=attachment%3B%20filename%2A%3D"
+                     "UTF-8%27%27PLQ110_16.0.5.702.zip&X-Amz-Signature=c620d9f2")
+        check("预签名取名(query 参数)",
+              derive_folder_name(presigned) == "PLQ110_16.0.5.702",
+              "got=%r" % derive_folder_name(presigned))
+
+        # 6c) HEAD 被拒（403）、只有 GET 头带文件名 -> 用 1 字节 Range GET 取名
+        with open(os.path.join(tmpdir, "presign_hash"), "wb") as handle:
+            handle.write(b"x")
+        session2 = ExtractorCore().new_session()
+        got = derive_folder_name("http://127.0.0.1:%d/presign_hash" % port, session2)
+        check("HEAD 403 时用 GET 取名", got == "预签名", "got=%r" % got)
 
         # 7) GUI 冒烟（子进程起窗口并截图后退出；无桌面环境时设 FW_NO_GUI=1 跳过）
         if os.environ.get("FW_NO_GUI") != "1":

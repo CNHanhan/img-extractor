@@ -1,5 +1,19 @@
 # 更新日志
 
+## v2.0.1 (2026-11-17)
+
+### 修复
+
+- **对象存储预签名直链取不到真实文件名**：这类链接形如
+  `https://xxx.cmecloud.cn/<32位ID>?response-content-disposition=attachment%3B%20filename%2A%3DUTF-8%27%27PLQ110_16.0.5.702.zip&X-Amz-Signature=...`
+  - 路径段是纯 ID（没有扩展名），旧逻辑于是去问服务器，但用的是 `HEAD`；
+    AWS SigV4 预签名链接**只对 GET 签名**，`HEAD` 必然 403，取不到头就退化成
+    `主机名_哈希`（就是那个 `ykj-eos-...cmecloud.cn_848647c4`）
+  - 现在三级兜底：① 直接解析 URL 查询串里的 `response-content-disposition`
+    ② `HEAD` 响应头 ③ `Range: bytes=0-0` 的 GET 响应头（1 字节，不浪费流量）
+  - 同一链接现在得到目录名 `PLQ110_16.0.5.702`
+- 自检扩到 22 项：新增「预签名 query 参数取名」「HEAD 403 时用 GET 取名」两例
+
 ## v2.0.0 (2026-11-16)
 
 首个 C++/Qt 迁移前的成熟版本，从"能跑"升级到"能分发"。
