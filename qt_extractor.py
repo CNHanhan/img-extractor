@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """固件远程提取工具 v2.0 —— PyQt5 单文件版
 
 相对 v1 的改动：
@@ -1115,6 +1115,28 @@ def run_selftest():
         got = derive_folder_name(dispatch_url, session)
         check("Content-Disposition 兜底", got == "真实名", "got=%r" % got)
 
+        # 7) GUI 冒烟（子进程起窗口并截图后退出；无桌面环境时设 FW_NO_GUI=1 跳过）
+        if os.environ.get("FW_NO_GUI") != "1":
+            import subprocess
+
+            shot = os.path.join(tmpdir, "gui.png")
+            argument = "--screenshot=" + shot
+            if getattr(sys, "frozen", False):
+                command = [sys.executable, argument]
+            else:
+                command = [sys.executable, os.path.abspath(__file__), argument]
+            ok, detail = False, ""
+            try:
+                proc = subprocess.run(command, timeout=180, capture_output=True)
+                ok = proc.returncode == 0 and os.path.exists(shot)
+                detail = "rc=%s" % proc.returncode
+                if not ok and proc.stderr:
+                    tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+                    detail += " | " + (tail[-1][:160] if tail else "")
+            except Exception as exc:
+                detail = str(exc)
+            check("GUI 窗口冒烟", ok, detail)
+
     except Exception:
         check("自检异常", False, traceback.format_exc().splitlines()[-1])
         lines.append(traceback.format_exc())
@@ -1390,7 +1412,7 @@ def main():
             root.addWidget(self.speed_label)
 
             for button in (self.btn_ota, self.btn_load, self.btn_list, self.btn_extract,
-                           self.btn_cancel, self.btn_open):
+                           self.btn_cancel):
                 button.setMinimumHeight(28)
 
             bottom = QHBoxLayout()
@@ -1400,6 +1422,7 @@ def main():
             self.log_edit.setMaximumHeight(130)
             bottom.addWidget(self.log_edit)
             self.btn_open = QPushButton("打开输出目录")
+            self.btn_open.setMinimumHeight(28)
             self.btn_open.clicked.connect(self.open_output_dir)
             bottom.addWidget(self.btn_open)
             root.addLayout(bottom)
