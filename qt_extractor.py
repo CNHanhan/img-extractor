@@ -15,6 +15,7 @@
 """
 
 import bz2
+import functools
 import hashlib
 import html as html_mod
 import lzma
@@ -50,7 +51,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -127,6 +128,51 @@ def fmt_eta(done, total, bps):
 
 class CancelledError(Exception):
     """用户取消提取"""
+
+
+def slot_guard(func):
+    """Qt 槽函数兜底
+
+    PyQt5 对槽函数里未捕获的异常会直接 qFatal() —— 表现就是整个窗口瞬间消失
+    （闪退，退出码 0xC0000409）。所有会碰界面/线程的槽都套一层，异常只记日志。
+    """
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except Exception:
+            detail = traceback.format_exc()
+            try:
+                with open(os.path.join(app_dir(), "extractor_error.log"),
+                          "a", encoding="utf-8") as handle:
+                    handle.write(detail + "\n")
+            except Exception:
+                pass
+            try:
+                print(detail, file=sys.stderr)
+            except Exception:
+                pass
+            return None
+
+    return wrapper
+
+
+def prune_finished_threads(threads):
+    """去掉已结束（或被 deleteLater 回收）的 QThread 引用
+
+    被 Qt 回收过的对象调用 isFinished() 会抛 RuntimeError，
+    直接留在列表里会在下一次展开目录时炸掉整个程序。
+    """
+    alive = []
+    for item in threads:
+        try:
+            if not item.isFinished():
+                alive.append(item)
+        except RuntimeError:
+            pass
+        except Exception:
+            alive.append(item)
+    return alive
 
 
 # --------------------------------------------------------------------------- #
@@ -528,18 +574,36 @@ class ParallelDownloader(object):
 # 来源解析（h5ai 目录 / Google OTA 页面）
 # --------------------------------------------------------------------------- #
 
+_MIRROR_HINT = {}   # 路径前缀 -> 上次成功的主机，避免每次都先撞死主站
+
+
+def mirror_key(url):
+    parts = urlsplit(url)
+    return "/".join(parts.path.split("/")[:4]) or parts.path
+
+
 def mirror_candidates(url):
-    """把 lolinet 的目录 URL 换成其它镜像主机，用于主站没内容时兜底"""
+    """把 lolinet 的目录 URL 换成其它镜像主机，用于主站没内容时兜底
+
+    命中过镜像的路径前缀会记住上次成功的主机，下次直接先问它。
+    """
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     if not host.endswith("lolinet.com"):
         return [url]
-    candidates = [url]
-    for mirror in LOLINET_HOSTS:
+    order = list(LOLINET_HOSTS)
+    hint = _MIRROR_HINT.get(mirror_key(url))
+    if hint in order:
+        order.remove(hint)
+        order.insert(0, hint)
+    candidates = []
+    for mirror in order:
         candidate = urlunsplit((parts.scheme or "https", mirror, parts.path,
                                 parts.query, parts.fragment))
         if candidate not in candidates:
             candidates.append(candidate)
+    if url not in candidates:
+        candidates.insert(0, url)
     return candidates
 
 
@@ -673,7 +737,7 @@ class ExtractorCore(object):
             self.check_cancel()
             session = self.new_session()
             try:
-                response = session.get(candidate, timeout=15)
+                response = session.get(candidate, timeout=8)
                 try:
                     if response.status_code != 200:
                         raise RuntimeError("HTTP %d" % response.status_code)
@@ -683,6 +747,7 @@ class ExtractorCore(object):
                 if dirs or files:
                     if candidate != url:
                         self.log("目录改走镜像: %s" % candidate)
+                        _MIRROR_HINT[mirror_key(url)] = (urlsplit(candidate).hostname or "")
                     return dirs, files, candidate
                 last_error = RuntimeError("目录为空")
             except CancelledError:
@@ -1127,6 +1192,23 @@ def run_selftest():
           " ".join(mirror_list))
     check("非 lolinet 主机不改写",
           mirror_candidates("https://example.com/a/") == ["https://example.com/a/"])
+
+    # 2b) 已回收 QThread 引用过滤（否则点第二次展开目录就闪退）
+    class _DeadThread(object):                     # 模拟被 deleteLater 回收的 QThread
+        def isFinished(self):
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+
+    class _LiveThread(object):
+        def __init__(self, running):
+            self.running = running
+
+        def isFinished(self):
+            return not self.running
+
+    survivors = prune_finished_threads(
+        [_LiveThread(True), _DeadThread(), _LiveThread(False)])
+    check("已回收线程被过滤", len(survivors) == 1 and survivors[0].running,
+          "剩 %d 个" % len(survivors))
     meter = SpeedMeter(window=2.0)
     meter.sample(0, 1000.0)
     bps = meter.sample(2 * 1024 * 1024, 1001.0)
@@ -1370,7 +1452,7 @@ def main():
 
     class DirFetch(QThread):
         done = pyqtSignal(str, object, object, str)
-        failed = pyqtSignal(str)
+        failed = pyqtSignal(str, str)
 
         def __init__(self, url, proxy, parent=None):
             super(DirFetch, self).__init__(parent)
@@ -1390,9 +1472,11 @@ def main():
             except CancelledError:
                 pass
             except Exception as exc:
-                self.failed.emit(str(exc))
+                self.failed.emit(self._url, str(exc))
 
     class MainWindow(QMainWindow):
+        LOADING_MARK = "__loading__"
+
         def __init__(self):
             super(MainWindow, self).__init__()
             self.setWindowTitle("%s  v%s" % (APP_NAME, APP_VERSION))
@@ -1557,6 +1641,7 @@ def main():
         def append_log(self, message):
             self.log_edit.appendPlainText(message)
 
+        @slot_guard
         def refresh_speed(self):
             core = self.core
             if core is None:
@@ -1610,6 +1695,7 @@ def main():
             self.job.failed.connect(self._job_failed)
             self.thread.start()
 
+        @slot_guard
         def _job_done(self, result):
             self.set_busy(False)
             if self.thread is not None:
@@ -1619,6 +1705,7 @@ def main():
             if callback is not None:
                 callback(result)
 
+        @slot_guard
         def _job_failed(self, message):
             self.set_busy(False)
             if self.thread is not None:
@@ -1637,6 +1724,7 @@ def main():
                 self._last_speed = 0.0
                 self.progress.setValue(0)
 
+        @slot_guard
         def cancel_job(self):
             if self.core is not None:
                 self.core.cancel.set()
@@ -1644,10 +1732,12 @@ def main():
 
         # -- OTA 列表 --------------------------------------------------- #
 
+        @slot_guard
         def start_fetch_ota(self):
             core = self.make_core()
             self.run_job(lambda: fetch_ota_devices(core), self.show_ota_dialog)
 
+        @slot_guard
         def show_ota_dialog(self, devices):
             if not devices:
                 return
@@ -1706,6 +1796,7 @@ def main():
                 return "lenowow"
             return "direct"
 
+        @slot_guard
         def _on_source_changed(self, *_args):
             source = self.current_source()
             self.tree.clear()
@@ -1725,31 +1816,49 @@ def main():
             root_item.setData(0, Qt.UserRole, base)
             self.fetch_children(root_item, base)
 
+        @slot_guard
         def fetch_children(self, item, url):
             if not url or item.childCount() > 0 or item.data(0, Qt.UserRole + 1):
                 return
             if not url.endswith("/"):
                 return
             item.setData(0, Qt.UserRole + 1, True)
+            loading = QTreeWidgetItem(item, ["加载中…", ""])
+            loading.setData(0, Qt.UserRole, self.LOADING_MARK)
             worker = DirFetch(url, self.proxy_dict(), self)
             worker.done.connect(self._fill_children)
             worker.failed.connect(self._dir_failed)
             worker.finished.connect(worker.deleteLater)
-            self._dir_threads = [item for item in self._dir_threads if not item.isFinished()]
+            self._dir_threads = prune_finished_threads(self._dir_threads)
             self._dir_threads.append(worker)
             worker.start()
 
-        def _dir_failed(self, message):
+        @slot_guard
+        def _dir_failed(self, url, message):
+            target = self._find_item(url)
+            if target is not None:
+                self._clear_loading(target)
+                target.setData(0, Qt.UserRole + 1, False)   # 允许重试
             self.append_log("加载目录失败: %s" % message)
 
-        def _fill_children(self, url, dirs, files, base):
-            target = None
+        def _clear_loading(self, item):
+            for index in range(item.childCount() - 1, -1, -1):
+                child = item.child(index)
+                if child.data(0, Qt.UserRole) == self.LOADING_MARK:
+                    item.removeChild(child)
+
+        def _find_item(self, url):
             for item in self._walk_items():
                 if item.data(0, Qt.UserRole) == url:
-                    target = item
-                    break
+                    return item
+            return None
+
+        @slot_guard
+        def _fill_children(self, url, dirs, files, base):
+            target = self._find_item(url)
             if target is None:
                 return
+            self._clear_loading(target)
             if base and base != url:
                 target.setData(0, Qt.UserRole, base)   # 记住实际可用的镜像主机
             for name, href in dirs:
@@ -1770,9 +1879,11 @@ def main():
                 for sub in self._walk_items(item):
                     yield sub
 
+        @slot_guard
         def on_tree_expanded(self, item):
             self.fetch_children(item, item.data(0, Qt.UserRole))
 
+        @slot_guard
         def on_tree_clicked(self, item, _column):
             href = item.data(0, Qt.UserRole)
             if not href:
@@ -1783,6 +1894,7 @@ def main():
             else:
                 item.setExpanded(True)
 
+        @slot_guard
         def load_selected_firmware(self):
             items = self.tree.selectedItems()
             if not items:
@@ -1795,6 +1907,7 @@ def main():
             else:
                 self.append_log("当前选中的是目录，请展开后选择 zip 固件")
 
+        @slot_guard
         def search_model(self):
             query = self.search_edit.text().strip().lower()
             if not query:
@@ -1809,6 +1922,7 @@ def main():
 
         # -- 解析 / 提取 ------------------------------------------------ #
 
+        @slot_guard
         def start_list(self):
             url = self.url_edit.text().strip()
             if not url:
@@ -1817,6 +1931,7 @@ def main():
             core = self.make_core()
             self.run_job(lambda: core.list_remote(url), self.show_list)
 
+        @slot_guard
         def show_list(self, result):
             if not result:
                 return
@@ -1858,6 +1973,7 @@ def main():
                     ordered.append(target)
             return ordered
 
+        @slot_guard
         def start_extract(self):
             url = self.url_edit.text().strip()
             if not url:
@@ -1871,6 +1987,7 @@ def main():
             self.append_log("开始提取，目标: %s" % ", ".join(targets))
             self.run_job(lambda: core.extract(url, targets), self.extract_done)
 
+        @slot_guard
         def extract_done(self, path):
             if not path:
                 self.append_log("提取已取消")
@@ -1880,6 +1997,7 @@ def main():
             QMessageBox.information(self, "完成", "提取完成！\n保存至: %s" % path)
             self.open_path(path)
 
+        @slot_guard
         def open_output_dir(self):
             base = self.core.output_root if self.core is not None else default_output_root()
             self.open_path(base)
@@ -1936,6 +2054,51 @@ def main():
                 window.close()          # 走 closeEvent，等后台线程收尾后再退出
 
         QTimer.singleShot(2500, grab_and_quit)
+
+    if "--expand-demo" in sys.argv[1:]:
+        demo_log = os.path.join(app_dir(), "expand-demo.log")
+        try:
+            open(demo_log, "w").close()
+        except Exception:
+            pass
+
+        def demo_write(message):
+            try:
+                with open(demo_log, "a", encoding="utf-8") as handle:
+                    handle.write(message + "\n")
+            except Exception:
+                pass
+            try:
+                print(message, flush=True)
+            except Exception:
+                pass
+
+        def demo_expand_root():
+            root = window.tree.topLevelItem(0)
+            if root is None:
+                demo_write("demo: 没有根节点")
+                window.close()
+                return
+            demo_write("demo: 展开根节点 %s" % root.text(0))
+            root.setExpanded(True)
+
+            def demo_expand_child():
+                demo_write("demo: 一级子节点数 = %d" % root.childCount())
+                if root.childCount():
+                    child = root.child(0)
+                    demo_write("demo: 展开 %s" % child.text(0))
+                    child.setExpanded(True)
+
+                    def demo_report():
+                        demo_write("demo: 二级子节点数 = %d" % child.childCount())
+                        demo_write("demo: 完成，无崩溃")
+                        window.close()
+
+                    QTimer.singleShot(14000, demo_report)
+
+            QTimer.singleShot(6000, demo_expand_child)
+
+        QTimer.singleShot(1500, demo_expand_root)
 
     sys.exit(application.exec_())
 
