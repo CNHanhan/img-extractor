@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -641,6 +641,56 @@ def parse_h5ai(html_text, base_url):
     return dirs, sorted(files, key=lambda item: item[0].lower())
 
 
+_MODEL_RE = re.compile(
+    r"Pixel\s+(?:\d+[a-z]?(?:\s+(?:Pro|XL|Fold|Tablet|Slate|a)){0,3}"
+    r"|XL|C|Fold|Tablet|Slate|Watch|Buds)\b", re.I)
+
+
+def clean_device_name(raw_text, codename=""):
+    """把 Google OTA 页上的冗长标题压成干净的机型名
+
+    'Pixel 11 的代号为“cubs”'           -> 'Pixel 11'
+    '“grizzly”（适用于 Pixel 11 Pro）'   -> 'Pixel 11 Pro'
+    'Pixel 11 Pro XL 的代号为“kodiak”'  -> 'Pixel 11 Pro XL'
+    '“stallion” : Pixel 10a'            -> 'Pixel 10a'
+    '适用于 Pixel 9a 的 “tegu”'          -> 'Pixel 9a'
+    """
+    text = (raw_text or "")
+    text = (text.replace("“", '"').replace("”", '"')
+                .replace("‘", "'").replace("’", "'").replace("\u00a0", " "))
+    code = (codename or "").strip()
+    if code:
+        escaped = re.escape(code)
+        for pattern in (
+            r"\s*的代号为\s*[\"']?%s[\"']?" % escaped,
+            r"[\"']?%s[\"']?\s*[:：]" % escaped,
+            r"[\"']%s[\"']" % escaped,
+            r"[\"']?%s[\"']?" % escaped,
+        ):
+            text = re.sub(pattern, " ", text, flags=re.I)
+    text = re.sub(r"[（(]\s*[)）]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -:：,，")
+    match = _MODEL_RE.search(text)
+    if match:
+        return match.group(0).strip()
+    # 非 Pixel 机型（Nexus 等）：清掉句子成分，再修掉不配对的括号
+    text = re.sub(r"适用于|的代号为|的|表示|对应", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -:：,，\"'")
+    # 句子里混进来的中文前缀（“…对应 Nexus 9”）直接切到产品名
+    marker = re.search(r"(Nexus|Pixel|Galaxy|Moto|Xiaomi|Redmi|OnePlus)\b", text, re.I)
+    if marker and marker.start() > 0:
+        text = text[marker.start():]
+    while len(text) > 2 and text[0] in "（([" and text[-1] in "）)]":
+        text = text[1:-1].strip()          # 去掉整体包裹的括号
+    for opener, closer in (("(", ")"), ("（", "）"), ("[", "]")):
+        while text.count(opener) > text.count(closer):
+            text = text[: text.rfind(opener)].rstrip()
+        while text.count(closer) > text.count(opener):
+            text = text[: text.rfind(closer)].rstrip()
+    text = re.sub(r"\s+", " ", text).strip(" -:：,，\"'")
+    return text or code or "unknown"
+
+
 def parse_ota_page(html_text):
     headings = list(re.finditer(r'<h2[^>]*id="([a-zA-Z0-9_]+)"[^>]*>', html_text))
     devices = []
@@ -648,7 +698,8 @@ def parse_ota_page(html_text):
         codename = heading.group(1)
         segment = html_text[heading.start(): heading.start() + 500]
         name_match = re.search(r'data-text="([^"]*)"', segment)
-        name = name_match.group(1) if name_match else codename
+        raw_name = html_mod.unescape(name_match.group(1)) if name_match else codename
+        name = clean_device_name(raw_name, codename)
         end = headings[index + 1].start() if index + 1 < len(headings) else len(html_text)
         block = html_text[heading.start(): end]
         raw_links = re.findall(
@@ -659,11 +710,17 @@ def parse_ota_page(html_text):
                 continue
             seen.add(file_name)
             link = "https://googledownloads.cn/android/aosp/%s.zip" % file_name
-            pieces = file_name.split("-")
-            version = "-".join(pieces[1:]) if len(pieces) > 1 else file_name
+            pieces = [piece for piece in file_name.split("-") if piece]
+            if len(pieces) > 1:
+                rest = [piece for piece in pieces[1:] if piece.lower() != "ota"]
+                version = "-".join(rest) if rest else "-".join(pieces[1:])
+            else:
+                version = file_name
             versions.append((version, link))
         if versions:
+            versions.sort(key=lambda item: item[0].lower(), reverse=True)
             devices.append({"codename": codename, "name": name, "versions": versions})
+    devices.sort(key=lambda item: (item["name"].lower(), item["codename"].lower()))
     return devices
 
 
@@ -1222,7 +1279,20 @@ def run_selftest():
     check("非 lolinet 主机不改写",
           mirror_candidates("https://example.com/a/") == ["https://example.com/a/"])
 
-    # 2b) 已回收 QThread 引用过滤（否则点第二次展开目录就闪退）
+    # 2b) 机型名清洗（Google OTA 页面标题很啰嗦）
+    name_cases = [
+        ('Pixel 11 的代号为“cubs”', "cubs", "Pixel 11"),
+        ('“grizzly”（适用于 Pixel 11 Pro）', "grizzly", "Pixel 11 Pro"),
+        ('Pixel 11 Pro XL 的代号为“kodiak”', "kodiak", "Pixel 11 Pro XL"),
+        ('“stallion” : Pixel 10a', "stallion", "Pixel 10a"),
+        ('适用于 Pixel 9a 的 “tegu”', "tegu", "Pixel 9a"),
+        ('Pixel 10 Pro Fold 的代号为“rango”', "rango", "Pixel 10 Pro Fold"),
+    ]
+    for raw, code, expect in name_cases:
+        got = clean_device_name(raw, code)
+        check("机型名清洗 %r" % expect, got == expect, "got=%r" % got)
+
+    # 2c) 已回收 QThread 引用过滤（否则点第二次展开目录就闪退）
     class _DeadThread(object):                     # 模拟被 deleteLater 回收的 QThread
         def isFinished(self):
             raise RuntimeError("wrapped C/C++ object has been deleted")
@@ -1561,6 +1631,54 @@ def run_e2e(window, log_path):
            "机型 %d / 版本 %d" % (len(captured.get("devices", [])), captured.get("versions", 0)))
     window.show_ota_dialog = type(window).show_ota_dialog
 
+    # 8b. OTA 对话框排版与选择
+    dialog = None
+    try:
+        dialog = window.ota_dialog_class(window, captured.get("devices", []))
+        labels = [dialog.device_list.item(index).text()
+                  for index in range(dialog.device_list.count())]
+        dirty = []
+        for label in labels:
+            name, _sep, code = label.partition(" — ")
+            if any(word in label for word in ("的代号为", "适用于", "表示", "对应")):
+                dirty.append(label)
+            elif code and (name.endswith("（%s）" % code) or name.endswith("(%s)" % code)):
+                dirty.append(label)          # 代号在两侧重复出现
+            elif name.count("(") != name.count(")") or name.count("（") != name.count("）"):
+                dirty.append(label)          # 括号不配对
+        version_rows = dialog.version_tree.topLevelItemCount()
+        link_text = dialog.link_edit.text()
+        try:
+            shot = os.path.join(os.path.dirname(log_path) or ".", "ota-dialog.png")
+            dialog.grab().save(shot)
+        except Exception:
+            pass
+        dialog.filter_edit.setText("pixel 11")
+        pump(250)
+        filtered = dialog.device_list.count()
+        dialog.filter_edit.setText("")
+        pump(250)
+        restored = dialog.device_list.count()
+        if dialog.version_tree.topLevelItemCount():
+            dialog.version_tree.setCurrentItem(dialog.version_tree.topLevelItem(0))
+            dialog._accept_selection()
+        chosen = dialog.chosen or ""
+        dialog.close()
+        dialog = None
+        record("OTA 对话框排版与选择",
+               not dirty and version_rows > 0 and link_text.lower().endswith(".zip")
+               and 0 < filtered < restored and chosen.lower().endswith(".zip"),
+               "机型 %d 个(脏标签 %d)，首个机型 %d 个版本，筛选后 %d 个，选中 %s" % (
+                   len(labels), len(dirty), version_rows, filtered,
+                   chosen.rsplit("/", 1)[-1][:36]))
+    except Exception as exc:
+        record("OTA 对话框排版与选择", False, str(exc)[:120])
+        if dialog is not None:
+            try:
+                dialog.close()
+            except Exception:
+                pass
+
     # 9. 解析真实 Full OTA
     window.url_edit.setText(REAL_OTA_URL)
     window.btn_list.click()         # 走真实按钮
@@ -1779,8 +1897,121 @@ def main():
             except Exception as exc:
                 self.failed.emit(self._url, str(exc))
 
+    class OtaDialog(QDialog):
+        """OTA 下载链接选择框：左边机型（可筛选），右边版本 + 文件名"""
+
+        def __init__(self, parent, devices):
+            super(OtaDialog, self).__init__(parent)
+            self.setWindowTitle("OTA 下载链接")
+            self.resize(1000, 580)
+            self.devices = devices
+            self.chosen = None
+            self._device_index = []
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+
+            filter_row = QHBoxLayout()
+            filter_row.addWidget(QLabel("筛选机型:"))
+            self.filter_edit = QLineEdit()
+            self.filter_edit.setPlaceholderText("输入机型或代号，例如 Pixel 11 / grizzly")
+            filter_row.addWidget(self.filter_edit, stretch=1)
+            layout.addLayout(filter_row)
+
+            body = QHBoxLayout()
+            self.device_list = QListWidget()
+            self.device_list.setFixedWidth(300)
+            body.addWidget(self.device_list)
+
+            right = QVBoxLayout()
+            self.version_tree = QTreeWidget()
+            self.version_tree.setHeaderLabels(["版本", "文件名"])
+            self.version_tree.setRootIsDecorated(False)
+            self.version_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.version_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+            right.addWidget(self.version_tree, stretch=1)
+
+            link_row = QHBoxLayout()
+            link_row.addWidget(QLabel("链接:"))
+            self.link_edit = QLineEdit()
+            self.link_edit.setReadOnly(True)
+            link_row.addWidget(self.link_edit, stretch=1)
+            right.addLayout(link_row)
+            body.addLayout(right, stretch=1)
+            layout.addLayout(body, stretch=1)
+
+            buttons = QHBoxLayout()
+            buttons.addStretch()
+            self.btn_choose = QPushButton("选择该版本")
+            self.btn_choose.setMinimumHeight(28)
+            self.btn_choose.clicked.connect(self._accept_selection)
+            self.btn_close = QPushButton("关闭")
+            self.btn_close.setMinimumHeight(28)
+            self.btn_close.clicked.connect(self.reject)
+            buttons.addWidget(self.btn_choose)
+            buttons.addWidget(self.btn_close)
+            layout.addLayout(buttons)
+
+            self.filter_edit.textChanged.connect(self._refresh_devices)
+            self.device_list.currentRowChanged.connect(self._on_device_changed)
+            self.version_tree.currentItemChanged.connect(self._on_version_changed)
+            self.version_tree.itemDoubleClicked.connect(lambda *_: self._accept_selection())
+            self._refresh_devices()
+
+        def _filtered(self):
+            keyword = self.filter_edit.text().strip().lower()
+            if not keyword:
+                return list(range(len(self.devices)))
+            return [index for index, device in enumerate(self.devices)
+                    if keyword in ("%s %s" % (device["name"], device["codename"])).lower()]
+
+        def _refresh_devices(self, *_args):
+            self.device_list.blockSignals(True)
+            self.device_list.clear()
+            self._device_index = self._filtered()
+            for index in self._device_index:
+                device = self.devices[index]
+                item = QListWidgetItem("%s — %s" % (device["name"], device["codename"]))
+                item.setToolTip("%s（%s）%d 个版本" % (
+                    device["name"], device["codename"], len(device["versions"])))
+                self.device_list.addItem(item)
+            self.device_list.blockSignals(False)
+            if self._device_index:
+                self.device_list.setCurrentRow(0)
+            else:
+                self.version_tree.clear()
+                self.link_edit.clear()
+
+        def _on_device_changed(self, row):
+            if row < 0 or row >= len(self._device_index):
+                return
+            device = self.devices[self._device_index[row]]
+            self.version_tree.clear()
+            self.link_edit.clear()
+            for version, link in device["versions"]:
+                file_name = link.rstrip("/").rsplit("/", 1)[-1]
+                item = QTreeWidgetItem(self.version_tree, [version, file_name])
+                item.setData(0, Qt.UserRole, link)
+                item.setToolTip(1, link)
+            if self.version_tree.topLevelItemCount():
+                self.version_tree.setCurrentItem(self.version_tree.topLevelItem(0))
+
+        def _on_version_changed(self, current, _previous=None):
+            if current is None:
+                return
+            self.link_edit.setText(current.data(0, Qt.UserRole) or "")
+
+        def _accept_selection(self):
+            item = self.version_tree.currentItem()
+            if item is None:
+                return
+            self.chosen = item.data(0, Qt.UserRole)
+            self.accept()
+
     class MainWindow(QMainWindow):
         LOADING_MARK = "__loading__"
+        ota_dialog_class = None
 
         def __init__(self):
             super(MainWindow, self).__init__()
@@ -2050,51 +2281,10 @@ def main():
         def show_ota_dialog(self, devices):
             if not devices:
                 return
-            dialog = QDialog(self)
-            dialog.setWindowTitle("OTA 下载链接列表")
-            dialog.resize(900, 520)
-            layout = QVBoxLayout(dialog)
-            layout.addWidget(QLabel("1. 选择机型:"))
-            combo = QComboBox()
-            combo.addItems(["%s  (%s)" % (item["name"], item["codename"]) for item in devices])
-            layout.addWidget(combo)
-            layout.addWidget(QLabel("2. 选择版本:"))
-            tree = QTreeWidget()
-            tree.setHeaderLabels(["版本", "下载链接"])
-            tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-            tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
-            layout.addWidget(tree, stretch=1)
-
-            def refresh():
-                tree.clear()
-                index = combo.currentIndex()
-                if 0 <= index < len(devices):
-                    for version, link in devices[index]["versions"]:
-                        QTreeWidgetItem(tree, [version, link])
-
-            combo.currentIndexChanged.connect(refresh)
-            refresh()
-
-            def accept_selection():
-                items = tree.selectedItems()
-                if not items:
-                    self.append_log("请先选择一个版本")
-                    return
-                self.url_edit.setText(items[0].text(1))
-                self.append_log("已选择链接 (已转换为 /android/ 格式)")
-                dialog.accept()
-
-            tree.itemDoubleClicked.connect(lambda *_: accept_selection())
-            buttons = QHBoxLayout()
-            buttons.addStretch()
-            accept = QPushButton("选择该版本")
-            accept.clicked.connect(accept_selection)
-            close = QPushButton("关闭")
-            close.clicked.connect(dialog.reject)
-            buttons.addWidget(accept)
-            buttons.addWidget(close)
-            layout.addLayout(buttons)
-            dialog.exec_()
+            dialog = OtaDialog(self, devices)
+            if dialog.exec_() == QDialog.Accepted and dialog.chosen:
+                self.url_edit.setText(dialog.chosen)
+                self.append_log("已选择链接: %s" % dialog.chosen)
 
         # -- 目录树 ----------------------------------------------------- #
 
@@ -2350,6 +2540,7 @@ def main():
                 time.sleep(0.2)
                 os._exit(0)
 
+    MainWindow.ota_dialog_class = OtaDialog
     application = QApplication(sys.argv)
     application.setStyleSheet(
         "QPushButton { min-height: 26px; padding: 3px 10px; }"

@@ -16,6 +16,9 @@
   - `cp1252`/`latin-1` 误解码的中文自动还原（`ç³»ç»Ÿ` → `系统`）
   - URL 里没有文件名时读 `Content-Disposition`，再不行回退 `主机名_哈希`
 - **来源发现**：h5ai 镜像目录树懒加载（Lenomola / Lenowow）、Google OTA 机型-版本列表
+  - OTA 列表重排版：左侧机型列表（`Pixel 11 Pro XL — kodiak`，可筛选），右侧
+    `版本` / `文件名` 两列，底部实时显示链接；页面上的冗长标题会被压成干净机型名
+    （`Pixel 11 的代号为“cubs”` → `Pixel 11`）
   - 镜像站已按年份分流：`mirrors.lolinet.com`（主站）、`mirrors-obs-1.lolinet.com`（2020–2021）、
     `mirrors-obs-2.lolinet.com`（2015–2019）。程序在某站目录为空时**自动切换其它镜像主机**，
     无需手动改地址
