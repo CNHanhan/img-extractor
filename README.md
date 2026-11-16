@@ -1,4 +1,4 @@
-# 固件远程提取工具 (img-extractor)
+﻿# 固件远程提取工具 (img-extractor)
 
 从 Android Full OTA 固件包（`.zip`）里**按需**提取 `boot.img` / `init_boot.img` / `vbmeta.img` / `vendor_boot.img` 等分区镜像。
 全程走 HTTP `Range` 请求，**不下载整个固件包**（动辄 2–4 GB），只取目标分区真正用到的字节段。
@@ -19,11 +19,18 @@
   - OTA 列表重排版：左侧机型列表（`Pixel 11 Pro XL — kodiak`，可筛选），右侧
     `版本` / `文件名` 两列，底部实时显示链接；页面上的冗长标题会被压成干净机型名
     （`Pixel 11 的代号为“cubs”` → `Pixel 11`）
+  - **机型从新到旧**：按发布年份倒序（`Pixel 11` → `Pixel 10` → `10a` → `9a` → … → `Nexus 7`），
+    版本按构建号里的 `YYMMDD` 倒序，新包在前
+
+    ![OTA 列表](docs/ota-dialog.png)
+
   - 镜像站已按年份分流：`mirrors.lolinet.com`（主站）、`mirrors-obs-1.lolinet.com`（2020–2021）、
     `mirrors-obs-2.lolinet.com`（2015–2019）。程序在某站目录为空时**自动切换其它镜像主机**，
     无需手动改地址
 - **可取消**：提取中途随时停止，不残留半成品写入线程
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
+
+> 当前版本 **v2.0.5** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 支持的 OTA 类型
 
@@ -152,4 +159,5 @@ PyInstaller 的产物**不是逐字节可复现**的（内嵌时间戳），请�
 ## 致谢
 
 - payload 格式参考 AOSP `update_engine` 与 [Payload-Dumper-Android](https://github.com/rajmani7584/Payload-Dumper-Android)
+
 
