@@ -1,0 +1,8 @@
+PyQt5>=5.15.9
+requests>=2.32
+remotezip>=0.12
+protobuf>=5.27
+zstandard>=0.22
+
+# 打包用（可选）
+# pyinstaller>=6.0

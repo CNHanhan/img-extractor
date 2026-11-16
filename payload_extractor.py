@@ -32,17 +32,44 @@ class UnsupportedOpError(PayloadError):
     pass
 
 
-def parse_header(data):
-    if data[:4] != b'CrAU':
+def header_info(buf):
+    """只读前 24 字节就能算出整个 payload 头部长度，避免盲目下载 5MB。
+
+    返回 (version, manifest_size, metadata_sig_size, need_bytes)
+    """
+    if len(buf) < 24:
+        raise PayloadError("payload 头部不足 24 字节")
+    if buf[:4] != b'CrAU':
         raise PayloadError("Not an OTA payload (missing CrAU magic)")
-    version = u64(data[4:12])
-    manifest_size = u64(data[12:20])
-    metadata_sig_size = u32(data[20:24]) if version > 1 else 0
+    version = u64(buf[4:12])
+    manifest_size = u64(buf[12:20])
+    metadata_sig_size = u32(buf[20:24]) if version > 1 else 0
+    return version, manifest_size, metadata_sig_size, 24 + manifest_size + metadata_sig_size
+
+
+def parse_header(data):
+    version, manifest_size, metadata_sig_size, need = header_info(data)
+    if len(data) < need:
+        raise PayloadError(
+            "payload 头部不完整：需要 %d 字节，实际 %d 字节" % (need, len(data))
+        )
     manifest_raw = data[24:24 + manifest_size]
-    data_offset = 24 + manifest_size + metadata_sig_size
+    data_offset = need
     dam = um.DeltaArchiveManifest()
     dam.ParseFromString(manifest_raw)
     return dam, data_offset, version
+
+
+def write_zeros(out_file, dst_extents, block_size, chunk=1 << 20):
+    """写零：按 chunk 分块写，避免一次性分配几百 MB 的 bytes。"""
+    zero = b'\x00' * max(min(chunk, 1 << 20), block_size)
+    for ext in dst_extents:
+        out_file.seek(ext.start_block * block_size)
+        remaining = ext.num_blocks * block_size
+        while remaining > 0:
+            n = min(len(zero), remaining)
+            out_file.write(zero[:n])
+            remaining -= n
 
 
 def list_partitions(dam):
