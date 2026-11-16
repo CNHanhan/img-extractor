@@ -29,7 +29,7 @@ import time
 import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import urllib3
 
@@ -61,6 +61,9 @@ HEADERS = {
 OTA_URL = "https://developers.google.cn/android/ota"
 HTTP_TIMEOUT = 60
 LOLINET_BASE = "https://mirrors.lolinet.com/firmware"
+# 官网按机型年份分流：2015-2019 -> mirrors-obs-2，2020-2021 -> mirrors-obs-1
+LOLINET_HOSTS = ("mirrors.lolinet.com", "mirrors-obs-1.lolinet.com",
+                 "mirrors-obs-2.lolinet.com")
 
 DEFAULT_WORKERS = 8
 CHUNK_SIZE = 8 * 1024 * 1024          # 单次 Range 请求最大字节数
@@ -486,6 +489,21 @@ class ParallelDownloader(object):
 # 来源解析（h5ai 目录 / Google OTA 页面）
 # --------------------------------------------------------------------------- #
 
+def mirror_candidates(url):
+    """把 lolinet 的目录 URL 换成其它镜像主机，用于主站没内容时兜底"""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if not host.endswith("lolinet.com"):
+        return [url]
+    candidates = [url]
+    for mirror in LOLINET_HOSTS:
+        candidate = urlunsplit((parts.scheme or "https", mirror, parts.path,
+                                parts.query, parts.fragment))
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def parse_h5ai(html_text, base_url):
     dirs, files = [], []
     skip = {"..", "Parent Directory", "powered by h5ai", "modern browsers"}
@@ -610,14 +628,29 @@ class ExtractorCore(object):
     # -- 目录浏览 --------------------------------------------------------- #
 
     def list_dir(self, url):
-        session = self.new_session()
-        response = session.get(url, timeout=HTTP_TIMEOUT)
-        try:
-            if response.status_code != 200:
-                raise RuntimeError("HTTP %d" % response.status_code)
-            return parse_h5ai(response.text, url)
-        finally:
-            response.close()
+        """返回 (dirs, files, effective_url)：主站目录为空时自动换 mirrors-obs-*"""
+        last_error = None
+        for candidate in mirror_candidates(url):
+            self.check_cancel()
+            session = self.new_session()
+            try:
+                response = session.get(candidate, timeout=15)
+                try:
+                    if response.status_code != 200:
+                        raise RuntimeError("HTTP %d" % response.status_code)
+                    dirs, files = parse_h5ai(response.text, candidate)
+                finally:
+                    response.close()
+                if dirs or files:
+                    if candidate != url:
+                        self.log("目录改走镜像: %s" % candidate)
+                    return dirs, files, candidate
+                last_error = RuntimeError("目录为空")
+            except CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError("目录获取失败: %s" % last_error)
 
     # -- 远端探测 --------------------------------------------------------- #
 
@@ -1041,6 +1074,13 @@ def run_selftest():
         check("目录名回退 %s" % url, got.startswith("x.com_") and len(got) > 8, "got=%r" % got)
 
     # 2) 测速 --------------------------------------------------------- #
+    mirror_list = mirror_candidates("https://mirrors.lolinet.com/firmware/lenomola/")
+    check("镜像候选主机",
+          len(mirror_list) == 3 and "mirrors-obs-1" in " ".join(mirror_list)
+          and "mirrors-obs-2" in " ".join(mirror_list),
+          " ".join(mirror_list))
+    check("非 lolinet 主机不改写",
+          mirror_candidates("https://example.com/a/") == ["https://example.com/a/"])
     meter = SpeedMeter(window=2.0)
     meter.sample(0, 1000.0)
     bps = meter.sample(2 * 1024 * 1024, 1001.0)
@@ -1126,13 +1166,27 @@ def run_selftest():
             else:
                 command = [sys.executable, os.path.abspath(__file__), argument]
             ok, detail = False, ""
+            child_env = dict(os.environ)
+            # onefile 打包后嵌套启动自身时，必须清掉 PyInstaller 的继承状态，
+            # 否则子进程会复用父进程的解包目录并崩溃（0xC0000409）
+            for key in ("_MEIPASS", "_MEIPASS2", "_PYI_APPLICATION_HOME_DIR",
+                        "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL",
+                        "_PYI_APPLICATION_HOME_DIR"):
+                child_env.pop(key, None)
+            child_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
             try:
-                proc = subprocess.run(command, timeout=180, capture_output=True)
+                import subprocess as _sp
+                proc = _sp.run(command, timeout=180, env=child_env,
+                               stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                 ok = proc.returncode == 0 and os.path.exists(shot)
                 detail = "rc=%s" % proc.returncode
-                if not ok and proc.stderr:
-                    tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-                    detail += " | " + (tail[-1][:160] if tail else "")
+                if not ok:
+                    error_log = os.path.join(app_dir(), "extractor_error.log")
+                    if os.path.exists(error_log):
+                        with open(error_log, "r", encoding="utf-8", errors="replace") as handle:
+                            tail = handle.read().strip().splitlines()
+                        if tail:
+                            detail += " | " + tail[-1][:160]
             except Exception as exc:
                 detail = str(exc)
             check("GUI 窗口冒烟", ok, detail)
@@ -1253,18 +1307,26 @@ def main():
                 self.failed.emit("%s\n%s" % (exc, traceback.format_exc()))
 
     class DirFetch(QThread):
-        done = pyqtSignal(str, object, object)
+        done = pyqtSignal(str, object, object, str)
         failed = pyqtSignal(str)
 
         def __init__(self, url, proxy, parent=None):
             super(DirFetch, self).__init__(parent)
             self._url = url
             self._proxy = proxy
+            self._core = None
+
+        def stop(self):
+            if self._core is not None:
+                self._core.cancel.set()
 
         def run(self):
             try:
-                dirs, files = ExtractorCore(proxy=self._proxy).list_dir(self._url)
-                self.done.emit(self._url, dirs, files)
+                self._core = ExtractorCore(proxy=self._proxy)
+                dirs, files, base = self._core.list_dir(self._url)
+                self.done.emit(self._url, dirs, files, base)
+            except CancelledError:
+                pass
             except Exception as exc:
                 self.failed.emit(str(exc))
 
@@ -1618,7 +1680,7 @@ def main():
         def _dir_failed(self, message):
             self.append_log("加载目录失败: %s" % message)
 
-        def _fill_children(self, url, dirs, files):
+        def _fill_children(self, url, dirs, files, base):
             target = None
             for item in self._walk_items():
                 if item.data(0, Qt.UserRole) == url:
@@ -1626,6 +1688,8 @@ def main():
                     break
             if target is None:
                 return
+            if base and base != url:
+                target.setData(0, Qt.UserRole, base)   # 记住实际可用的镜像主机
             for name, href in dirs:
                 child = QTreeWidgetItem(target, [name + "/", ""])
                 child.setData(0, Qt.UserRole, href)
@@ -1768,20 +1832,27 @@ def main():
         def closeEvent(self, event):
             if self.core is not None:
                 self.core.cancel.set()
-            for worker in list(self._dir_threads):
-                try:
-                    if worker.isRunning():
-                        worker.quit()
-                        worker.wait(1000)
-                except RuntimeError:
-                    pass
             if self.thread is not None:
                 try:
                     self.thread.quit()
-                    self.thread.wait(3000)
+                    self.thread.wait(5000)
+                except RuntimeError:
+                    pass
+            still_running = False
+            for worker in list(self._dir_threads):
+                try:
+                    worker.stop()
+                    worker.quit()
+                    if not worker.wait(800):
+                        still_running = True
                 except RuntimeError:
                     pass
             event.accept()
+            if still_running:
+                # 目录线程卡在 socket 上（requests 无法中断），
+                # 直接结束进程，避免 QThread 运行中被析构导致 0xC0000409 崩溃
+                time.sleep(0.2)
+                os._exit(0)
 
     application = QApplication(sys.argv)
     application.setStyleSheet(
