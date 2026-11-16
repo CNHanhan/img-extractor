@@ -59,7 +59,11 @@ $env:PYTHONPATH = "$PWD\libs"
 python qt_extractor.py
 ```
 
-## 自检
+## 测试
+
+三套测试都可以直接跑，返回码 `0` 表示全部通过。
+
+### 1. 离线自检（23 项，不需要联网）
 
 ```powershell
 python qt_extractor.py --selftest
@@ -67,10 +71,32 @@ python qt_extractor.py --selftest
 .\dist\FirmwareExtractor.exe --selftest
 ```
 
-自检覆盖（20 项）：目录名推导（7 种乱码/伪文件名场景）、镜像候选改写与不动非 lolinet 主机、
-测速、端到端全流程（本地 Range 服务器 + 合成 Full OTA，raw/zstd/bz2/xz/zero 五种 op）、
-1 线程与 8 线程输出一致性、取消机制、普通 zip 并行提取、`Content-Disposition` 兜底、
-GUI 窗口冒烟（子进程起窗口截图后退出）。结果写入 `selftest.log`，返回码 `0` 表示全部通过。
+覆盖：目录名推导（UTF-8/GBK 百分号编码、cp1252 乱码、保留名、超长名共 7 例）、
+预签名 `response-content-disposition` 取名、HEAD 403 时用 1 字节 GET 取名、
+镜像候选改写、测速、已回收线程过滤、端到端合成 Full OTA（`raw/zstd/bz2/xz/zero` 五种 op）、
+1 线程 vs 8 线程输出一致性、取消、普通 zip 并行提取、GUI 窗口冒烟。
+结果写入 `selftest.log`。
+
+### 2. 端到端点测（15 项，联网 + 真实固件）
+
+```powershell
+python qt_extractor.py --e2e=e2e.log
+.\dist\FirmwareExtractor.exe --e2e=e2e.log
+```
+
+驱动真实窗口、点真实按钮，逐项验证：GUI 启动、目录树根节点、展开年份（镜像兜底）、
+展开机型目录、单击 zip 填链接、型号搜索、来源切换、获取 Google OTA 列表、
+解析真实 Full OTA、真实提取 `boot.img`（校验 `ANDROID!` 魔数 + 实时网速 + 进度 100）、
+提取中取消、代理可用、代理端口不可用不崩、打开输出目录、关闭窗口。
+
+### 3. 目录树回归
+
+```powershell
+python qt_extractor.py --expand-demo
+```
+
+自动展开「根 → 第一个年份」，把过程写进 `expand-demo.log`。
+专治「点年份闪退」这类只在交互路径上出现的问题。
 
 ## 打包单文件 exe
 

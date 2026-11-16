@@ -18,6 +18,7 @@ import bz2
 import functools
 import hashlib
 import html as html_mod
+import inspect
 import lzma
 import mmap
 import os
@@ -51,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -135,9 +136,23 @@ def slot_guard(func):
 
     PyQt5 对槽函数里未捕获的异常会直接 qFatal() —— 表现就是整个窗口瞬间消失
     （闪退，退出码 0xC0000409）。所有会碰界面/线程的槽都套一层，异常只记日志。
+
+    另外：Qt 的 clicked 信号会带一个 bool（checked），而 `def start_list(self)` 这类
+    槽不接受参数，PyQt 一旦看到 *args 签名就会把 bool 传进来 -> TypeError。
+    这里按被装饰函数的真实入参个数裁剪，避免按钮点了没反应。
     """
+    try:
+        accepted = len(inspect.signature(func).parameters) - 1   # 减去 self
+        if any(param.kind == inspect.Parameter.VAR_POSITIONAL
+               for param in inspect.signature(func).parameters.values()):
+            accepted = None
+    except (TypeError, ValueError):
+        accepted = None
+
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        if accepted is not None and len(args) > accepted:
+            args = args[:accepted]
         try:
             return func(self, *args, **kwargs)
         except Exception:
@@ -685,12 +700,20 @@ class ExtractorCore(object):
 
         self.bytes_done = 0
         self.dl_total = 0
+        self.dl_started = 0.0
+        self.dl_finished = 0.0
         self.phase = "idle"
         self.speed = SpeedMeter()
         self._last_pct = -1
         self._probe_cache = {}
 
     # -- helpers ---------------------------------------------------------- #
+
+    def average_speed(self):
+        """本次下载阶段的平均速度（字节/秒），用于完成提示"""
+        if self.dl_started <= 0 or self.dl_finished <= self.dl_started:
+            return 0.0
+        return max(0.0, float(self.bytes_done) / (self.dl_finished - self.dl_started))
 
     def log(self, message):
         if self._log_fn:
@@ -880,6 +903,8 @@ class ExtractorCore(object):
         self.phase = "download"
         self.dl_total = total
         self.bytes_done = 0
+        self.dl_started = time.monotonic()
+        self.dl_finished = 0.0
         self.speed.reset()
         downloader = ParallelDownloader(
             url=url,
@@ -890,6 +915,7 @@ class ExtractorCore(object):
             cancel=self.cancel,
         )
         view = downloader.download(ranges)
+        self.dl_finished = time.monotonic()
         try:
             self.phase = "write"
             self._write_partitions(dam, wanted, view,
@@ -969,6 +995,8 @@ class ExtractorCore(object):
         self.phase = "download"
         self.dl_total = total
         self.bytes_done = 0
+        self.dl_started = time.monotonic()
+        self.dl_finished = 0.0
         self.speed.reset()
         lock = threading.Lock()
         workers = max(1, min(self.workers, len(wanted)))
@@ -999,6 +1027,7 @@ class ExtractorCore(object):
             futures = [executor.submit(extract_one, name) for name in wanted]
             for future in as_completed(futures):
                 future.result()
+        self.dl_finished = time.monotonic()
 
 
 # --------------------------------------------------------------------------- #
@@ -1360,6 +1389,282 @@ def run_selftest():
 # 图形界面
 # --------------------------------------------------------------------------- #
 
+REAL_OTA_URL = ("https://googledownloads.cn/android/aosp/"
+                "cubs-ota-cd1a.260618.001.a7-7f02515d.zip")
+
+
+def run_e2e(window, log_path):
+    """真·端到端点测：驱动真实窗口 + 真实网络 + 真实提取，逐项写日志
+
+    用法：python qt_extractor.py --e2e=e2e.log
+    返回 True 表示全部通过。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QApplication, QMessageBox
+
+    app = QApplication.instance()
+    results = []
+
+    try:
+        open(log_path, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+
+    def record(name, ok, detail=""):
+        results.append((name, bool(ok), detail))
+        line = "%s %s%s" % ("PASS" if ok else "FAIL", name, (" | " + detail) if detail else "")
+        try:
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+
+    def pump(ms):
+        end = time.monotonic() + ms / 1000.0
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.03)
+
+    def wait(pred, timeout, on_tick=None):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            app.processEvents()
+            if on_tick is not None:
+                on_tick()
+            if pred():
+                return True
+            time.sleep(0.03)
+        return False
+
+    # 弹窗类阻塞全部打桩，避免自动化被模态框卡住
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+    opened = []
+    window.open_path = staticmethod(lambda path: opened.append(path))
+
+    loading_mark = getattr(type(window), "LOADING_MARK", "__loading__")
+
+    def real_children(item):
+        """排除“加载中…”占位项后的真实子节点数"""
+        if item is None:
+            return 0
+        return sum(1 for index in range(item.childCount())
+                   if item.child(index).data(0, Qt.UserRole) != loading_mark)
+
+    pump(1200)
+
+    # 1. 窗口
+    record("GUI 启动", window.isVisible(), window.windowTitle())
+
+    # 2. 目录树根节点
+    root = window.tree.topLevelItem(0)
+    ok = wait(lambda: real_children(root) > 0, 60)
+    record("目录树根节点加载", ok, "子节点 %d" % real_children(root))
+
+    # 3. 展开年份（2020 在主站为空，走镜像兜底）
+    year_item = None
+    if root is not None:
+        for index in range(root.childCount()):
+            child = root.child(index)
+            if child.text(0).startswith("2020"):
+                year_item = child
+                break
+        if year_item is None and root.childCount():
+            year_item = root.child(0)
+    if year_item is not None:
+        year_item.setExpanded(True)
+        ok = wait(lambda: real_children(year_item) > 0, 180)
+        record("展开年份目录", ok, "%s → %d 个机型" % (year_item.text(0), real_children(year_item)))
+    else:
+        record("展开年份目录", False, "没有年份节点")
+
+    # 4. 展开机型目录
+    device_item = None
+    if year_item is not None:
+        for index in range(year_item.childCount()):
+            child = year_item.child(index)
+            if child.data(0, Qt.UserRole) != loading_mark:
+                device_item = child
+                break
+    if device_item is not None:
+        device_item.setExpanded(True)
+        ok = wait(lambda: real_children(device_item) > 0, 180)
+        record("展开机型目录", ok,
+               "%s → %d 项" % (device_item.text(0), real_children(device_item)))
+    else:
+        record("展开机型目录", False, "没有机型节点")
+
+    # 5. 单击 zip 节点填充链接（机型目录下面还可能有子目录，逐层下钻）
+    def find_zip_item():
+        for node in window._walk_items():
+            href = node.data(0, Qt.UserRole)
+            if isinstance(href, str) and href.lower().split("?")[0].endswith(".zip"):
+                return node
+        return None
+
+    zip_item = None
+    for _round in range(6):
+        zip_item = find_zip_item()
+        if zip_item is not None:
+            break
+        leaves = []
+        for node in window._walk_items():
+            href = node.data(0, Qt.UserRole)
+            if isinstance(href, str) and href.endswith("/") and real_children(node) == 0:
+                leaves.append(node)
+        if not leaves:
+            break
+        leaves[0].setExpanded(True)
+        wait(lambda: real_children(leaves[0]) > 0, 60)
+
+    if zip_item is not None:
+        window.on_tree_clicked(zip_item, 0)
+        pump(300)
+        url_text = window.url_edit.text()
+        record("单击 zip 填充链接", url_text.lower().split("?")[0].endswith(".zip"),
+               url_text[-70:])
+    else:
+        record("单击 zip 填充链接", False, "展开 6 层仍没有 zip 节点")
+
+    # 6. 型号搜索
+    if device_item is not None:
+        keyword = device_item.text(0).rstrip("/")
+        window.search_edit.setText(keyword)
+        window.search_model()
+        pump(300)
+        record("型号搜索", window.tree.currentItem() is not None, keyword,)
+    else:
+        record("型号搜索", False, "无节点可搜")
+
+    # 7. 来源切换
+    window.radio_direct.setChecked(True)
+    pump(300)
+    hidden_on_direct = not window.browser_box.isVisible()
+    window.radio_moto.setChecked(True)
+    pump(1200)
+    record("来源切换(直接链接隐藏浏览器)", hidden_on_direct and window.browser_box.isVisible())
+
+    # 8. OTA 列表抓取（真实页面，用桩替代模态对话框）
+    captured = {}
+
+    def fake_dialog(devices):
+        captured["devices"] = devices
+        captured["versions"] = sum(len(d["versions"]) for d in devices)
+
+    window.show_ota_dialog = fake_dialog
+    window.btn_ota.click()          # 走真实按钮 -> clicked(bool) -> 槽
+    ok = wait(lambda: "devices" in captured, 90)
+    record("获取 Google OTA 列表", ok,
+           "机型 %d / 版本 %d" % (len(captured.get("devices", [])), captured.get("versions", 0)))
+    window.show_ota_dialog = type(window).show_ota_dialog
+
+    # 9. 解析真实 Full OTA
+    window.url_edit.setText(REAL_OTA_URL)
+    window.btn_list.click()         # 走真实按钮
+    ok = wait(lambda: window.file_list.count() > 0, 150)
+    status = window.status_label.text()
+    record("解析列表(真实 Full OTA)", ok and "Full OTA" in status,
+           "%d 项 | %s" % (window.file_list.count(), status[:40]))
+
+    # 10. 真实提取 boot.img（并行下载 + 网速 + 进度）
+    for widget in (window.chk_init, window.chk_vbmeta, window.chk_vendor):
+        widget.setChecked(False)
+    window.chk_boot.setChecked(True)
+    speeds = []
+    window.btn_extract.click()      # 走真实按钮
+    window.speed_timer.isActive()   # 测速定时器应处于运行状态
+
+    def tick():
+        window.refresh_speed()
+        speeds.append(window.speed_label.text())
+
+    ok = wait(lambda: window.btn_extract.isEnabled() and window.progress.value() >= 100, 300,
+              on_tick=tick)
+    boot_path = None
+    for root_dir, _dirs, files in os.walk(default_output_root()):
+        if "boot.img" in files:
+            candidate = os.path.join(root_dir, "boot.img")
+            if boot_path is None or os.path.getmtime(candidate) > os.path.getmtime(boot_path):
+                boot_path = candidate
+    magic = b""
+    if boot_path:
+        with open(boot_path, "rb") as handle:
+            magic = handle.read(8)
+    live_speed_seen = any("MB/s" in text for text in speeds)
+    final_label = window.speed_label.text()
+    record("真实提取 boot.img",
+           ok and magic == b"ANDROID!" and (live_speed_seen or "平均" in final_label),
+           "img=%s 大小=%s 实时网速=%s 完成提示=%s" % (
+               "有" if boot_path else "无",
+               fmt_size(os.path.getsize(boot_path)) if boot_path else "-",
+               "有" if live_speed_seen else "无",
+               final_label.split("（")[-1][:40] if "（" in final_label else "无平均速度"))
+
+    # 11. 取消提取
+    cancel_target = None
+    for index in range(window.file_list.count()):
+        item = window.file_list.item(index)
+        if item.data(Qt.UserRole) in ("system", "vendor", "product", "system_ext"):
+            item.setCheckState(Qt.Checked)
+            cancel_target = item.data(Qt.UserRole)
+            break
+    window.chk_boot.setChecked(False)
+    window.btn_extract.click()      # 走真实按钮
+    pump(4000)
+    window.btn_cancel.click()       # 走真实按钮
+    ok = wait(lambda: window.btn_extract.isEnabled(), 120)
+    record("提取中取消", ok, "目标分区 %s，日志/状态已恢复" % cancel_target)
+
+    # 12. 代理可用场景
+    window.chk_proxy.setChecked(True)
+    window.port_edit.setText("10808")
+    core = window.make_core()
+    proxy_ok, proxy_detail = False, ""
+    try:
+        devices = fetch_ota_devices(core)
+        proxy_ok = len(devices) > 10
+        proxy_detail = "机型 %d" % len(devices)
+    except Exception as exc:
+        proxy_detail = str(exc)[:80]
+    record("代理下载(127.0.0.1:10808)", proxy_ok, proxy_detail)
+
+    # 13. 代理不可用场景（必须优雅报错，不能崩）
+    window.port_edit.setText("1")
+    core = window.make_core()
+    dead_ok = False
+    try:
+        fetch_ota_devices(core)
+        dead_ok = False
+    except Exception:
+        dead_ok = True
+    window.chk_proxy.setChecked(False)
+    record("代理端口不可用时报错不崩", dead_ok)
+
+    # 14. 打开输出目录
+    window.btn_open.click()
+    pump(300)
+    record("打开输出目录按钮", bool(opened) and os.path.isdir(default_output_root()),
+           opened[0] if opened else "未触发")
+
+    # 15. 关闭窗口
+    window.close()
+    pump(500)
+    record("关闭窗口", not window.isVisible())
+
+    failures = [name for name, ok, _detail in results if not ok]
+    summary = "端到端点测: %d 项通过, %d 项失败" % (len(results) - len(failures), len(failures))
+    try:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(summary + "\n")
+    except Exception:
+        pass
+    print(summary, flush=True)
+    return not failures
+
+
 def _qt_namespace():
     from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
     from PyQt5.QtGui import QFont, QIcon
@@ -1660,7 +1965,10 @@ def main():
             elif core.phase == "write":
                 self.speed_label.setText("正在写入镜像，请稍候…")
             elif core.phase == "done":
-                self.speed_label.setText("完成")
+                # 不要覆盖 extract_done() 写好的“完成：xxx（下载…平均…）”摘要
+                if not (self.speed_label.text().startswith("完成")
+                        or self.speed_label.text().startswith("已取消")):
+                    self.speed_label.setText("完成")
 
         # -- 配置 ------------------------------------------------------- #
 
@@ -1723,6 +2031,7 @@ def main():
             if busy:
                 self._last_speed = 0.0
                 self.progress.setValue(0)
+                self.speed_label.setText("准备中…")
 
         @slot_guard
         def cancel_job(self):
@@ -1993,8 +2302,15 @@ def main():
                 self.append_log("提取已取消")
                 self.speed_label.setText("已取消")
                 return
-            self.speed_label.setText("完成：%s" % path)
-            QMessageBox.information(self, "完成", "提取完成！\n保存至: %s" % path)
+            summary = ""
+            core = self.core
+            if core is not None and core.dl_total:
+                average = core.average_speed()
+                if average > 0:
+                    summary = "（下载 %s，平均 %s）" % (fmt_size(core.dl_total), fmt_speed(average))
+            self.speed_label.setText("完成：%s%s" % (path, summary))
+            self.append_log("完成: %s%s" % (path, summary))
+            QMessageBox.information(self, "完成", "提取完成！\n保存至: %s%s" % (path, summary))
             self.open_path(path)
 
         @slot_guard
@@ -2100,6 +2416,15 @@ def main():
 
         QTimer.singleShot(1500, demo_expand_root)
 
+    e2e_log = None
+    for argument in sys.argv[1:]:
+        if argument.startswith("--e2e="):
+            e2e_log = argument.split("=", 1)[1]
+    if e2e_log:
+        ok = run_e2e(window, e2e_log)
+        application.quit()
+        sys.exit(0 if ok else 1)
+
     sys.exit(application.exec_())
 
 
@@ -2115,5 +2440,6 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
 
 
