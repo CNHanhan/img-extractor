@@ -85,13 +85,28 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
 
 | 文件 | 说明 |
 |---|---|
-| `qt_extractor.py` | PyQt5 主程序（GUI + 并行下载 + 提取核心 + 自检） |
+| `qt_extractor.py` | 主程序（PyQt5 GUI + 并行下载 + 提取核心 + 自检） |
 | `payload_extractor.py` | OTA payload 解析：`CrAU` 头、manifest、extent 落盘 |
 | `update_metadata_pb2.py` | `update_metadata.proto` 生成代码（protobuf） |
-| `extractor.py` | 早期 tkinter 版本（保留参考） |
+| `build.ps1` | 一键装依赖 + 打包单文件 exe |
+| `requirements.txt` | 运行依赖 |
+| `docs/screenshot.png` | 界面截图 |
+
+> v1 的 tkinter 版本（`extractor.py`）与打包残留脚本已退役，需要考古请查 `git log`。
 
 ## 注意
 
 - 工具只做**完整包（Full OTA）**；增量包（`payload` 里带 bsdiff 系列 op）不受支持。
 - 部分镜像站不支持 `Range`，此时会明确提示而不是产出坏镜像。
 - 校验：下载的每个 op 数据都会比对 manifest 里的 `data_sha256_hash`；不一致立即中止。
+- onefile 程序启动时需要往 `%TEMP%` 解包：请把 exe 放在常规目录
+  （`D:\tools\`、桌面等）。**受组策略/沙箱限制为低完整性（Low Integrity）的目录**
+  （部分 OneDrive 同步目录、安全软件隔离区、某些工作区）会导致
+  `Could not create temporary directory!`，换个目录即可。
+- 镜像站按年份分流：`mirrors.lolinet.com`（主站）、`mirrors-obs-1`（2020–2021）、
+  `mirrors-obs-2`（2015–2019），程序目录为空时自动换主机。
+
+## 致谢
+
+- payload 格式参考 AOSP `update_engine` 与 [Payload-Dumper-Android](https://github.com/rajmani7584/Payload-Dumper-Android)
+
