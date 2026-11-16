@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """固件远程提取工具 v2.0 —— PyQt5 单文件版
 
 相对 v1 的改动：
@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.5"
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -646,6 +646,45 @@ _MODEL_RE = re.compile(
     r"|XL|C|Fold|Tablet|Slate|Watch|Buds)\b", re.I)
 
 
+_DEVICE_YEAR_HINTS = {
+    "pixel fold": 2023.0, "pixel tablet": 2023.0, "pixel c": 2015.0,
+    "pixel watch": 2022.0, "pixel xl": 2016.0, "pixel": 2016.0,
+    "nexus player": 2014.0, "nexus 10": 2012.0, "nexus 9": 2014.0,
+    "nexus 7": 2013.0, "nexus 6p": 2015.0, "nexus 6": 2014.0,
+    "nexus 5x": 2015.0, "nexus 5": 2013.0, "nexus 4": 2012.0,
+    "nexus s": 2010.0, "nexus one": 2010.0,
+}
+
+
+def device_year(name):
+    """估算机型发布年份，用于“新的排前面”
+
+    Pixel N 的年份 ≈ N + 2015（Pixel 6=2021 … Pixel 11=2026）；
+    带 a 的（Pixel 9a）比同代晚半年；Pixel Fold / Tablet / Nexus 等查表。
+    """
+    text = (name or "").lower().strip()
+    match = re.search(r"pixel\s+(\d+)", text)
+    if match:
+        year = float(int(match.group(1)) + 2015)
+        if re.search(r"\d+\s*a\b", text):
+            year += 0.5
+        return year
+    for key in sorted(_DEVICE_YEAR_HINTS, key=len, reverse=True):
+        if text.startswith(key):
+            return _DEVICE_YEAR_HINTS[key]
+    return 0.0
+
+
+def version_sort_key(version):
+    """构建号里带 YYMMDD（cp4a.261105.040），用它排序最准"""
+    match = re.search(r"\.(\d{2})(\d{2})(\d{2})(?:\.|$)", version or "")
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return (1, year * 10000 + month * 100 + day)
+    return (0, 0)
+
+
 def clean_device_name(raw_text, codename=""):
     """把 Google OTA 页上的冗长标题压成干净的机型名
 
@@ -718,9 +757,11 @@ def parse_ota_page(html_text):
                 version = file_name
             versions.append((version, link))
         if versions:
-            versions.sort(key=lambda item: item[0].lower(), reverse=True)
+            versions.sort(key=lambda item: (version_sort_key(item[0]), item[0]), reverse=True)
             devices.append({"codename": codename, "name": name, "versions": versions})
-    devices.sort(key=lambda item: (item["name"].lower(), item["codename"].lower()))
+    # 从新到旧：Pixel 11/Android 17 的机型排在 Pixel 10/Android 16 前面
+    devices.sort(key=lambda device: (-device_year(device["name"]),
+                                     device["name"].lower(), device["codename"].lower()))
     return devices
 
 
@@ -1292,7 +1333,36 @@ def run_selftest():
         got = clean_device_name(raw, code)
         check("机型名清洗 %r" % expect, got == expect, "got=%r" % got)
 
-    # 2c) 已回收 QThread 引用过滤（否则点第二次展开目录就闪退）
+    # 2c) 机型排序：新的在前（Pixel 11 / Android 17 早于 Pixel 10 / Android 16）
+    years = [device_year(name) for name in
+             ("Pixel 11", "Pixel 10 Pro XL", "Pixel 10", "Pixel 9a", "Pixel 9", "Pixel Fold")]
+    check("机型年份估算(Pixel 9a 晚于 9)", years[2] > years[3] > years[4],
+          " ".join("%s=%.1f" % (n, y) for n, y in zip(("P10", "P9a", "P9"), years[2:])))
+    check("机型年份估算(11 > 10)",
+          device_year("Pixel 11 Pro XL") > device_year("Pixel 10 Pro XL"),
+          "%.1f > %.1f" % (device_year("Pixel 11 Pro XL"), device_year("Pixel 10 Pro XL")))
+
+    # 2d) 版本号排序：构建号里的 YYMMDD 说了算
+    newer = version_sort_key("cp4a.261105.040.d1-37020ad7")
+    older = version_sort_key("cd1a.260618.001.a7-7f02515d")
+    unknown = version_sort_key("mob31e-284a96a5")
+    check("版本号按日期排序", newer > older > unknown, "%s > %s > %s" % (newer, older, unknown))
+
+    # 2e) 页面解析后的顺序就是从新到旧
+    fake_page = (
+        '<h2 id="frankel" data-text="Pixel 10 的代号为“frankel”">X</h2>'
+        '<a href="https://googledownloads.cn/dl/android/aosp/frankel-ota-cp1a.251020.001-aaaa.zip">l</a>'
+        '<h2 id="cubs" data-text="Pixel 11 的代号为“cubs”">X</h2>'
+        '<a href="https://googledownloads.cn/dl/android/aosp/cubs-ota-cp4a.261105.040-bbbb.zip">l</a>'
+        '<h2 id="tegu" data-text="适用于 Pixel 9a 的 “tegu”">X</h2>'
+        '<a href="https://googledownloads.cn/dl/android/aosp/tegu-ota-cd1a.260618.001-cccc.zip">l</a>'
+    )
+    parsed = parse_ota_page(fake_page)
+    order = [device["name"] for device in parsed]
+    check("OTA 列表从新到旧排序", order == ["Pixel 11", "Pixel 10", "Pixel 9a"],
+          " → ".join(order))
+
+    # 2f) 已回收 QThread 引用过滤（否则点第二次展开目录就闪退）
     class _DeadThread(object):                     # 模拟被 deleteLater 回收的 QThread
         def isFinished(self):
             raise RuntimeError("wrapped C/C++ object has been deleted")
@@ -1665,6 +1735,16 @@ def run_e2e(window, log_path):
         chosen = dialog.chosen or ""
         dialog.close()
         dialog = None
+
+        # 列表必须从新到旧（Pixel 11 在 Pixel 10 之前）
+        names = [label.partition(" — ")[0] for label in labels]
+        years = [device_year(name) for name in names]
+        ordered = all(years[index] >= years[index + 1]
+                      for index in range(len(years) - 1))
+        record("OTA 列表从新到旧",
+               ordered and names and device_year(names[0]) >= 2025,
+               "首项 %s(%.1f)，末项 %s(%.1f)" % (names[0], years[0],
+                                               names[-1], years[-1]) if names else "空列表")
         record("OTA 对话框排版与选择",
                not dirty and version_rows > 0 and link_text.lower().endswith(".zip")
                and 0 < filtered < restored and chosen.lower().endswith(".zip"),
@@ -2631,6 +2711,7 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
 
 
 

@@ -1,5 +1,28 @@
 # 更新日志
 
+## v2.0.5 (2026-11-17)
+
+OTA 列表改成**从新到旧**。
+
+### 改进
+
+- **机型按发布年份倒序**：`Pixel 11` / Android 16-17 的机型排在 `Pixel 10` / Android 15-16 前面，
+  不再按字母排（字母序会把 `Pixel 9a` 排到 `Pixel 10` 后面）
+  - `Pixel N` 的年份按 `N + 2015` 估算（Pixel 6=2021 … Pixel 11=2026）
+  - 带 `a` 的（Pixel 9a）比同代晚半年，所以 `Pixel 10 > Pixel 9a > Pixel 9`
+  - `Pixel Fold` / `Pixel Tablet` / `Pixel C` / `Pixel XL` / Nexus 系列查表补年份
+  - 同年份内按名称排（`Pixel 10` → `Pixel 10 Pro` → `Pixel 10 Pro Fold` → `Pixel 10 Pro XL`）
+- **版本按构建日期倒序**：从构建号里抽 `YYMMDD`（`cp4a.261105.040` → 2026-11-05），
+  比按字符串排准；没有日期的（如 Nexus 的 `mob31e-284a96a5`）排在后面
+- 实测顺序：`Pixel 11 → 11 Pro → 11 Pro Fold → 11 Pro XL → 10a → 10 → 10 Pro →
+  10 Pro Fold → 10 Pro XL → 9a → 9 → 9 Pro → … → Nexus 7 [2013]`
+
+### 测试
+
+- 自检 **33/33**（新增：机型年份估算、版本日期排序、假页面解析后的顺序）
+- 端到端 **17/17**（新增「OTA 列表从新到旧」：首项 Pixel 11(2026.0)、末项 Nexus 7(2013.0)，
+  逐项年份单调不增）
+
 ## v2.0.4 (2026-11-17)
 
 OTA 下载列表重做。
