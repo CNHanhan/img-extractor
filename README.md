@@ -1,4 +1,4 @@
-﻿# 固件远程提取工具 (img-extractor)
+# 固件远程提取工具 (img-extractor)
 
 从 Android Full OTA 固件包（`.zip`）里**按需**提取 `boot.img` / `init_boot.img` / `vbmeta.img` / `vendor_boot.img` 等分区镜像。
 全程走 HTTP `Range` 请求，**不下载整个固件包**（动辄 2–4 GB），只取目标分区真正用到的字节段。
@@ -30,7 +30,16 @@
 - **可取消**：提取中途随时停止，不残留半成品写入线程
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
 
-> 当前版本 **v2.0.5** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本 **v2.0.6** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+
+## 临时文件在哪
+
+| 场景 | 位置 | 是否自动删除 |
+|---|---|---|
+| 提取数据 ≤ 256 MB | 内存 | — |
+| 提取数据 > 256 MB | `%TEMP%\fw_buf_<随机>.bin`（日志会打印完整路径） | 提取结束/取消即删；进程被强杀则下次启动清理 2 小时前的残留 |
+| 单文件 exe 自身解包 | `%TEMP%\_MEIxxxxx\` | 退出时删 |
+| 最终产物 | exe 同级 `extracted_images\<固件名>\` | 不删 |
 
 ## 支持的 OTA 类型
 

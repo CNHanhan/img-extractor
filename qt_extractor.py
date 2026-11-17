@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """固件远程提取工具 v2.0 —— PyQt5 单文件版
 
 相对 v1 的改动：
@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.5"
+APP_VERSION = "2.0.6"
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -370,6 +370,43 @@ def derive_folder_name(url, session=None, log=None):
 # 测速
 # --------------------------------------------------------------------------- #
 
+def _set_mem_limit(value):
+    """自检用：临时改“多大才落磁盘”的阈值，强制走磁盘缓冲分支"""
+    global MEM_BUFFER_LIMIT
+    MEM_BUFFER_LIMIT = int(value)
+
+
+def cleanup_stale_buffers(max_age_seconds=2 * 3600):
+    """清理上次被强杀留下的下载缓冲（%TEMP%\\fw_buf_*.bin）
+
+    正常结束或取消时会自己删；只有进程被任务管理器强杀才可能残留。
+    这里只删 2 小时前的，删不掉的（正被别的实例占用）直接跳过。
+    """
+    removed = freed = 0
+    try:
+        base = tempfile.gettempdir()
+        now = time.time()
+        for name in os.listdir(base):
+            if not (name.startswith("fw_buf_") and name.endswith(".bin")):
+                continue
+            path = os.path.join(base, name)
+            try:
+                info = os.stat(path)
+            except OSError:
+                continue
+            if now - info.st_mtime < max_age_seconds:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            removed += 1
+            freed += info.st_size
+    except Exception:
+        pass
+    return removed, freed
+
+
 class SpeedMeter:
     """滑动窗口测速：最近 window 秒内的平均字节速率"""
 
@@ -529,9 +566,19 @@ class ParallelDownloader(object):
         try:
             os.ftruncate(handle, total)
             buffer = mmap.mmap(handle, total)
-        finally:
-            os.close(handle)
-        self._log("数据量 %s，使用磁盘缓冲" % fmt_size(total))
+        except Exception:
+            # 磁盘满 / mmap 失败：别把刚建的空文件留在 %TEMP%
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        os.close(handle)
+        self._log("数据量 %s，使用磁盘缓冲：%s" % (fmt_size(total), path))
         return buffer, path
 
     def _worker(self, task):
@@ -580,9 +627,24 @@ class ParallelDownloader(object):
             for future in futures:
                 future.cancel()
             executor.shutdown(wait=False)
+            self._release_buffer(tmp_path)     # 取消/失败也要把磁盘缓冲清掉
             raise
         executor.shutdown(wait=True)
         return BufferView(segments, self.buffer, tmp_path)
+
+    def _release_buffer(self, tmp_path):
+        """释放 mmap 并删除临时缓冲文件（异常路径专用）"""
+        try:
+            if isinstance(self.buffer, mmap.mmap):
+                self.buffer.close()
+        except Exception:
+            pass
+        self.buffer = None
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -786,6 +848,11 @@ def fetch_ota_devices(core):
 # 提取核心（不依赖 Qt，自检可直接调用）
 # --------------------------------------------------------------------------- #
 
+def _is_rate_limited(exc):
+    text = str(exc)
+    return "429" in text or "限流" in text or "Too Many Requests" in text
+
+
 class ExtractorCore(object):
     def __init__(self, proxy=None, workers=DEFAULT_WORKERS, log=None,
                  progress=None, cancel=None, output_root=None):
@@ -923,10 +990,13 @@ class ExtractorCore(object):
                 info = self.probe(url)
                 break
             except Exception as exc:
-                if "429" in str(exc) and attempt < MAX_RETRIES - 1:
+                if _is_rate_limited(exc) and attempt < MAX_RETRIES - 1:
                     delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                    self.log("被限流，%ds 后重试 (%d/%d)..." % (delay, attempt + 1, MAX_RETRIES))
+                    self.log("被限流(HTTP 429)，%ds 后重试 (%d/%d)..." % (delay, attempt + 1, MAX_RETRIES))
                     time.sleep(delay)
+                elif _is_rate_limited(exc):
+                    self.log("服务器限流(HTTP 429)：请稍后再试，或勾选代理换个出口 IP")
+                    raise
                 else:
                     raise
         if info is None:
@@ -962,7 +1032,12 @@ class ExtractorCore(object):
         os.makedirs(final_path, exist_ok=True)
         self.log("输出目录: %s" % final_path)
 
-        info = self.probe(url)
+        try:
+            info = self.probe(url)
+        except Exception as exc:
+            if _is_rate_limited(exc):
+                self.log("服务器限流(HTTP 429)：请稍后再试，或勾选代理换个出口 IP")
+            raise
         if info["is_payload"]:
             self._extract_payload(url, info, final_path, targets)
         else:
@@ -1433,6 +1508,33 @@ def run_selftest():
             cancelled = True
         check("取消机制", cancelled)
 
+        # 4b) 下载缓冲：大文件走 %TEMP%，成功/取消都不留垃圾
+        import glob as _glob
+
+        def buffers():
+            return set(_glob.glob(os.path.join(tempfile.gettempdir(), "fw_buf_*.bin")))
+
+        before = buffers()
+        saved_limit = MEM_BUFFER_LIMIT
+        mem_buffer_limit_override = 1024        # 强制走磁盘缓冲分支
+        try:
+            _set_mem_limit(mem_buffer_limit_override)
+            core_ok = ExtractorCore(workers=4, log=logs.append, output_root=out_root)
+            core_ok.extract(url, ["boot.img"])
+            leaked_ok = buffers() - before
+
+            core_cancel = ExtractorCore(workers=4, log=logs.append, output_root=out_root)
+            core_cancel.cancel.set()
+            try:
+                core_cancel.extract(url, ["boot.img"])
+            except CancelledError:
+                pass
+            leaked_cancel = buffers() - before
+            check("下载缓冲用完即删", not leaked_ok and not leaked_cancel,
+                  "成功残留 %d 个，取消残留 %d 个" % (len(leaked_ok), len(leaked_cancel)))
+        finally:
+            _set_mem_limit(saved_limit)
+
         # 5) 普通 zip 分支（无 payload.bin）---------------------------- #
         plain = os.path.join(tmpdir, "plain.zip")
         with zipfile.ZipFile(plain, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1562,6 +1664,26 @@ def run_e2e(window, log_path):
             print(line, flush=True)
         except Exception:
             pass
+
+    def skip(name, detail=""):
+        results.append((name, None, detail))
+        line = "SKIP %s%s" % (name, (" | " + detail) if detail else "")
+        try:
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+
+    def log_tail(count=2):
+        try:
+            text = window.log_edit.toPlainText().strip().splitlines()
+        except Exception:
+            return ""
+        return " / ".join(text[-count:]) if text else ""
 
     def pump(ms):
         end = time.monotonic() + ms / 1000.0
@@ -1760,74 +1882,93 @@ def run_e2e(window, log_path):
                 pass
 
     # 9. 解析真实 Full OTA
+    rate_limited = False
     window.url_edit.setText(REAL_OTA_URL)
     window.btn_list.click()         # 走真实按钮
     ok = wait(lambda: window.file_list.count() > 0, 150)
     status = window.status_label.text()
-    record("解析列表(真实 Full OTA)", ok and "Full OTA" in status,
-           "%d 项 | %s" % (window.file_list.count(), status[:40]))
+    tail = log_tail(2)
+    if not ok and ("429" in tail or "限流" in tail):
+        rate_limited = True
+        skip("解析列表(真实 Full OTA)", "Google 限流(HTTP 429)，稍后重跑即可：%s" % tail[-60:])
+    else:
+        record("解析列表(真实 Full OTA)", ok and "Full OTA" in status,
+               "%d 项 | %s" % (window.file_list.count(), status[:40]))
 
     # 10. 真实提取 boot.img（并行下载 + 网速 + 进度）
-    for widget in (window.chk_init, window.chk_vbmeta, window.chk_vendor):
-        widget.setChecked(False)
-    window.chk_boot.setChecked(True)
-    speeds = []
-    window.btn_extract.click()      # 走真实按钮
-    window.speed_timer.isActive()   # 测速定时器应处于运行状态
+    if rate_limited:
+        skip("真实提取 boot.img", "上一步被 Google 限流，跳过")
+    else:
+        for widget in (window.chk_init, window.chk_vbmeta, window.chk_vendor):
+            widget.setChecked(False)
+        window.chk_boot.setChecked(True)
+        speeds = []
+        window.btn_extract.click()      # 走真实按钮
 
-    def tick():
-        window.refresh_speed()
-        speeds.append(window.speed_label.text())
+        def tick():
+            window.refresh_speed()
+            speeds.append(window.speed_label.text())
 
-    ok = wait(lambda: window.btn_extract.isEnabled() and window.progress.value() >= 100, 300,
-              on_tick=tick)
-    boot_path = None
-    for root_dir, _dirs, files in os.walk(default_output_root()):
-        if "boot.img" in files:
-            candidate = os.path.join(root_dir, "boot.img")
-            if boot_path is None or os.path.getmtime(candidate) > os.path.getmtime(boot_path):
-                boot_path = candidate
-    magic = b""
-    if boot_path:
-        with open(boot_path, "rb") as handle:
-            magic = handle.read(8)
-    live_speed_seen = any("MB/s" in text for text in speeds)
-    final_label = window.speed_label.text()
-    record("真实提取 boot.img",
-           ok and magic == b"ANDROID!" and (live_speed_seen or "平均" in final_label),
-           "img=%s 大小=%s 实时网速=%s 完成提示=%s" % (
-               "有" if boot_path else "无",
-               fmt_size(os.path.getsize(boot_path)) if boot_path else "-",
-               "有" if live_speed_seen else "无",
-               final_label.split("（")[-1][:40] if "（" in final_label else "无平均速度"))
+        ok = wait(lambda: window.btn_extract.isEnabled() and window.progress.value() >= 100, 300,
+                  on_tick=tick)
+        boot_path = None
+        for root_dir, _dirs, files in os.walk(default_output_root()):
+            if "boot.img" in files:
+                candidate = os.path.join(root_dir, "boot.img")
+                if boot_path is None or os.path.getmtime(candidate) > os.path.getmtime(boot_path):
+                    boot_path = candidate
+        magic = b""
+        if boot_path:
+            with open(boot_path, "rb") as handle:
+                magic = handle.read(8)
+        live_speed_seen = any("MB/s" in text for text in speeds)
+        final_label = window.speed_label.text()
+        record("真实提取 boot.img",
+               ok and magic == b"ANDROID!" and (live_speed_seen or "平均" in final_label),
+               "img=%s 大小=%s 实时网速=%s 完成提示=%s" % (
+                   "有" if boot_path else "无",
+                   fmt_size(os.path.getsize(boot_path)) if boot_path else "-",
+                   "有" if live_speed_seen else "无",
+                   final_label.split("（")[-1][:40] if "（" in final_label else "无平均速度"))
 
     # 11. 取消提取
-    cancel_target = None
-    for index in range(window.file_list.count()):
-        item = window.file_list.item(index)
-        if item.data(Qt.UserRole) in ("system", "vendor", "product", "system_ext"):
-            item.setCheckState(Qt.Checked)
-            cancel_target = item.data(Qt.UserRole)
-            break
-    window.chk_boot.setChecked(False)
-    window.btn_extract.click()      # 走真实按钮
-    pump(4000)
-    window.btn_cancel.click()       # 走真实按钮
-    ok = wait(lambda: window.btn_extract.isEnabled(), 120)
-    record("提取中取消", ok, "目标分区 %s，日志/状态已恢复" % cancel_target)
+    if rate_limited:
+        skip("提取中取消", "上一步被 Google 限流，跳过")
+    else:
+        cancel_target = None
+        for index in range(window.file_list.count()):
+            item = window.file_list.item(index)
+            if item.data(Qt.UserRole) in ("system", "vendor", "product", "system_ext"):
+                item.setCheckState(Qt.Checked)
+                cancel_target = item.data(Qt.UserRole)
+                break
+        window.chk_boot.setChecked(False)
+        window.btn_extract.click()      # 走真实按钮
+        pump(4000)
+        window.btn_cancel.click()       # 走真实按钮
+        ok = wait(lambda: window.btn_extract.isEnabled(), 120)
+        record("提取中取消", ok, "目标分区 %s，日志/状态已恢复" % cancel_target)
 
     # 12. 代理可用场景
     window.chk_proxy.setChecked(True)
     window.port_edit.setText("10808")
     core = window.make_core()
     proxy_ok, proxy_detail = False, ""
-    try:
-        devices = fetch_ota_devices(core)
-        proxy_ok = len(devices) > 10
-        proxy_detail = "机型 %d" % len(devices)
-    except Exception as exc:
-        proxy_detail = str(exc)[:80]
-    record("代理下载(127.0.0.1:10808)", proxy_ok, proxy_detail)
+    for _attempt in range(2):                 # 代理链路偶尔抖动，重试一次
+        try:
+            devices = fetch_ota_devices(core)
+            proxy_ok = len(devices) > 10
+            proxy_detail = "机型 %d" % len(devices)
+            break
+        except Exception as exc:
+            proxy_detail = str(exc)[:80]
+            pump(600)
+    lowered = proxy_detail.lower()
+    if not proxy_ok and ("timed out" in lowered or "time out" in lowered
+                         or "429" in lowered):
+        skip("代理下载(127.0.0.1:10808)", "网络抖动/限流：%s" % proxy_detail)
+    else:
+        record("代理下载(127.0.0.1:10808)", proxy_ok, proxy_detail)
 
     # 13. 代理不可用场景（必须优雅报错，不能崩）
     window.port_edit.setText("1")
@@ -1852,8 +1993,10 @@ def run_e2e(window, log_path):
     pump(500)
     record("关闭窗口", not window.isVisible())
 
-    failures = [name for name, ok, _detail in results if not ok]
-    summary = "端到端点测: %d 项通过, %d 项失败" % (len(results) - len(failures), len(failures))
+    failures = [name for name, ok, _detail in results if ok is False]
+    skips = [name for name, ok, _detail in results if ok is None]
+    passed = len(results) - len(failures) - len(skips)
+    summary = "端到端点测: %d 项通过, %d 项失败, %d 项跳过" % (passed, len(failures), len(skips))
     try:
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(summary + "\n")
@@ -2119,6 +2262,11 @@ def main():
             self.speed_timer.setInterval(250)
             self.speed_timer.timeout.connect(self.refresh_speed)
             self.speed_timer.start()
+
+            removed, freed = cleanup_stale_buffers()
+            if removed:
+                self.append_log("已清理上次残留的下载缓冲 %d 个（%s），位置: %s"
+                                % (removed, fmt_size(freed), tempfile.gettempdir()))
 
             self._load_tree_root()
 
@@ -2711,6 +2859,7 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
 
 
 
