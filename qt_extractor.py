@@ -52,7 +52,63 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.6"
+APP_VERSION = "2.0.7"
+
+# --------------------------------------------------------------------------- #
+# 主题（浅色 / 深色）
+# --------------------------------------------------------------------------- #
+
+BASE_STYLE = (
+    "QPushButton { min-height: 26px; padding: 3px 10px; }"
+    "QLineEdit, QSpinBox, QComboBox { min-height: 22px; }"
+)
+
+LIGHT_STYLE = BASE_STYLE + (
+    "QTreeWidget, QListWidget { alternate-background-color: palette(base); }"
+)
+
+DARK_STYLE = BASE_STYLE + """
+QWidget { background: #1e1e1e; color: #d4d4d4; }
+QMainWindow, QDialog { background: #1e1e1e; }
+QGroupBox { border: 1px solid #3c3c3c; border-radius: 4px; margin-top: 9px; }
+QGroupBox::title { subcontrol-origin: margin; padding: 0 5px; color: #d4d4d4; }
+QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QListWidget, QTreeWidget {
+    background: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 3px;
+    padding: 2px;
+}
+QPushButton {
+    background: #2d2d30; color: #d4d4d4; border: 1px solid #3c3c3c;
+    border-radius: 3px; min-height: 26px; padding: 3px 10px;
+}
+QPushButton:hover { background: #3e3e42; }
+QPushButton:pressed { background: #094771; }
+QPushButton:disabled { background: #252526; color: #6b6b6b; border-color: #333; }
+QCheckBox, QRadioButton { color: #d4d4d4; background: transparent; }
+QCheckBox::indicator:unchecked, QRadioButton::indicator:unchecked {
+    background: #252526; border: 1px solid #6b6b6b;
+}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background: #0e639c; border: 1px solid #0e639c;
+}
+QProgressBar {
+    background: #252526; border: 1px solid #3c3c3c; border-radius: 3px;
+    text-align: center; color: #d4d4d4;
+}
+QProgressBar::chunk { background: #0e639c; border-radius: 2px; }
+QHeaderView::section { background: #2d2d30; color: #d4d4d4; border: 1px solid #3c3c3c; padding: 3px; }
+QTreeWidget::item, QListWidget::item { padding: 2px; }
+QTreeWidget::item:selected, QListWidget::item:selected { background: #094771; color: #ffffff; }
+QScrollBar:vertical, QScrollBar:horizontal { background: #1e1e1e; border: none; }
+QScrollBar::handle { background: #424242; border-radius: 4px; min-height: 18px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0px; width: 0px; }
+QToolTip { background: #2d2d30; color: #d4d4d4; border: 1px solid #3c3c3c; }
+"""
+
+
+def build_stylesheet(dark):
+    """按主题返回完整 QSS（纯字符串函数，自检里不依赖 Qt 也能测）"""
+    return DARK_STYLE if dark else LIGHT_STYLE
+
 
 MAX_RETRIES = 5
 RETRY_DELAYS = [5, 10, 20, 40, 60]
@@ -88,6 +144,25 @@ def app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def theme_config_path():
+    """主题偏好配置文件：放在 exe 同级，纯文本文件（dark / light）"""
+    return os.path.join(app_dir(), "theme.txt")
+
+
+_THEME_OVERRIDE = None   # --theme=dark/light 显式覆盖（截图/自动化用）
+
+
+def load_theme_setting():
+    """读取上次保存的主题；没存过返回默认浅色"""
+    if _THEME_OVERRIDE is not None:
+        return _THEME_OVERRIDE == "dark"
+    try:
+        with open(theme_config_path(), "r", encoding="utf-8") as handle:
+            return "dark" in handle.read().lower()
+    except Exception:
+        return False
 
 
 def default_output_root():
@@ -1368,6 +1443,41 @@ def run_selftest():
             failures.append(name)
         print(lines[-1])
 
+    # CLI 的 --theme= 覆盖只影响 GUI，不影响自检对配置文件的读写
+    global _THEME_OVERRIDE
+    _THEME_OVERRIDE = None
+
+    # 0) 主题 stylesheet ------------------------------------------------ #
+    light_css = build_stylesheet(False)
+    dark_css = build_stylesheet(True)
+    check("深色主题样式表", "#1e1e1e" in dark_css and "#0e639c" in dark_css
+          and len(dark_css) > 800, "%d 字符" % len(dark_css))
+    check("浅色主题样式表", "alternate-background-color" in light_css
+          and "#1e1e1e" not in light_css, "%d 字符" % len(light_css))
+    theme_file = theme_config_path()
+    original_theme = None
+    try:
+        with open(theme_file, "r", encoding="utf-8") as handle:
+            original_theme = handle.read()
+    except Exception:
+        pass
+    try:
+        with open(theme_file, "w", encoding="utf-8") as handle:
+            handle.write("dark")
+        check("主题偏好读取", load_theme_setting() is True)
+        with open(theme_file, "w", encoding="utf-8") as handle:
+            handle.write("light")
+        check("主题偏好读取(浅色)", load_theme_setting() is False)
+    finally:
+        try:
+            if original_theme is None:
+                os.remove(theme_file)
+            else:
+                with open(theme_file, "w", encoding="utf-8") as handle:
+                    handle.write(original_theme)
+        except Exception:
+            pass
+
     # 1) 目录名推导 --------------------------------------------------- #
     name_cases = [
         ("https://mirrors.lolinet.com/firmware/lenomola/2024/x/%E5%9B%BA%E4%BB%B6.zip", "固件"),
@@ -1808,6 +1918,22 @@ def run_e2e(window, log_path):
     window.radio_moto.setChecked(True)
     pump(1200)
     record("来源切换(直接链接隐藏浏览器)", hidden_on_direct and window.browser_box.isVisible())
+
+    # 7b. 主题切换（真实点击按钮 + 截图）
+    window.btn_theme.click()  # 切到深色
+    pump(300)
+    dark_on = (window._dark_theme
+               and "#1e1e1e" in (QApplication.instance().styleSheet() or ""))
+    try:
+        window.grab().save(os.path.join(os.path.dirname(log_path) or ".", "dark-mode.png"))
+    except Exception:
+        pass
+    window.btn_theme.click()  # 切回浅色
+    pump(300)
+    light_back = (not window._dark_theme
+                  and "#1e1e1e" not in (QApplication.instance().styleSheet() or ""))
+    record("深色模式切换", dark_on and light_back,
+           "深色生效=%s 浅色恢复=%s" % (dark_on, light_back))
 
     # 8. OTA 列表抓取（真实页面，用桩替代模态对话框）
     captured = {}
@@ -2251,6 +2377,7 @@ def main():
             self._on_done = None
             self._dir_threads = []
             self._last_speed = 0.0
+            self._dark_theme = False
 
             self._build_ui()
 
@@ -2267,6 +2394,9 @@ def main():
             if removed:
                 self.append_log("已清理上次残留的下载缓冲 %d 个（%s），位置: %s"
                                 % (removed, fmt_size(freed), tempfile.gettempdir()))
+
+            self.btn_theme.toggled.connect(self.toggle_theme)
+            self.apply_theme(load_theme_setting(), save=False)
 
             self._load_tree_root()
 
@@ -2311,6 +2441,12 @@ def main():
                 top.addWidget(radio)
                 radio.toggled.connect(self._on_source_changed)
             top.addStretch()
+
+            self.btn_theme = QPushButton("🌙 深色")
+            self.btn_theme.setCheckable(True)
+            self.btn_theme.setMinimumHeight(28)
+            self.btn_theme.setToolTip("切换浅色 / 深色主题（自动记住上次选择）")
+            top.addWidget(self.btn_theme)
             root.addLayout(top)
 
             self.browser_box = QGroupBox("固件浏览器")
@@ -2399,6 +2535,32 @@ def main():
             self.btn_open.clicked.connect(self.open_output_dir)
             bottom.addWidget(self.btn_open)
             root.addLayout(bottom)
+
+        # -- 主题 -------------------------------------------------------- #
+
+        def apply_theme(self, dark, save=True):
+            """切换主题：整套 QSS + 日志底色 + 按钮文案，并记住选择"""
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(build_stylesheet(dark))
+            self._dark_theme = bool(dark)
+            self.log_edit.setStyleSheet(
+                "QPlainTextEdit { background: #1e1e1e; color: #d4d4d4; }"
+                if dark else "QPlainTextEdit { background: #f8f8f8; color: #202020; }")
+            self.btn_theme.blockSignals(True)   # 防止 setChecked 反过来触发 toggle
+            self.btn_theme.setChecked(bool(dark))
+            self.btn_theme.blockSignals(False)
+            self.btn_theme.setText("☀️ 浅色" if dark else "🌙 深色")
+            if save:
+                try:
+                    with open(theme_config_path(), "w", encoding="utf-8") as handle:
+                        handle.write("dark" if dark else "light")
+                except Exception:
+                    pass
+
+        @slot_guard
+        def toggle_theme(self, *_args):
+            self.apply_theme(not self._dark_theme)
 
         # -- 日志 / 测速 ------------------------------------------------ #
 
@@ -2769,11 +2931,14 @@ def main():
                 os._exit(0)
 
     MainWindow.ota_dialog_class = OtaDialog
+    global _THEME_OVERRIDE
+    _THEME_OVERRIDE = None
+    for argument in sys.argv[1:]:
+        if argument.startswith("--theme="):
+            _THEME_OVERRIDE = argument.split("=", 1)[1].lower()
+            break
     application = QApplication(sys.argv)
-    application.setStyleSheet(
-        "QPushButton { min-height: 26px; padding: 3px 10px; }"
-        "QLineEdit, QSpinBox, QComboBox { min-height: 22px; }"
-        "QTreeWidget, QListWidget { alternate-background-color: palette(base); }")
+    application.setStyleSheet(build_stylesheet(load_theme_setting()))
     window = MainWindow()
     window.show()
 
