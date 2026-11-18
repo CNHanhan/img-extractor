@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.4.2"
+APP_VERSION = "2.4.3"
 
 # 目录树：展开一个节点时向后预加载的层数与并发数（目录最深 5 层，一次拉满）
 PREFETCH_DEPTH = 5
@@ -2931,7 +2931,11 @@ def run_targeted_test(window, log_path):
                 handle.write(line + "\n")
         except Exception:
             pass
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            # GBK 控制台打不出 ✓/✗ 等符号，日志已落盘，忽略即可
+            pass
 
     def pump(ms):
         end = time.monotonic() + ms / 1000.0
@@ -2966,7 +2970,7 @@ def run_targeted_test(window, log_path):
     # 1. 改动的常量
     record("预加载深度=5", PREFETCH_DEPTH == 5,
            "DEPTH=%d WORKERS=%d" % (PREFETCH_DEPTH, PREFETCH_WORKERS))
-    record("版本号=2.4.2", APP_VERSION == "2.4.2", APP_VERSION)
+    record("版本号=2.4.3", APP_VERSION == "2.4.3", APP_VERSION)
 
     # 2. 删除的控件
     record("已删除『直接链接』单选", not hasattr(window, "radio_direct"))
@@ -3000,6 +3004,31 @@ def run_targeted_test(window, log_path):
     record("来源切换 Moto/Lenovo 重建树", lenovo_ok and moto_ok,
            "lenovo=%s moto=%s" % (lenovo_ok, moto_ok))
 
+    # 6a. 本次改动重点：点击切换后立即有可见反馈（加载中或已完成提示均可；
+    #     首层秒回时进度条会迅速复位，不能只认忙碌态这一瞬时状态）
+    window.radio_lenovo.setChecked(True)
+    pump(60)
+    status_during = window.tree_status.text()
+    has_feedback = ("加载" in status_during) or ("已加载" in status_during)
+    record("目录加载即时提示", has_feedback,
+           "status=%r" % status_during)
+
+    # 6b. 首层加载完成后立即显示“已加载”+ 进度条复位到 0-100
+    ok = wait(lambda: "已加载" in window.tree_status.text(), 120)
+    status_after = window.tree_status.text()
+    reset = (window.progress.minimum() == 0 and window.progress.maximum() == 100)
+    record("目录加载完成提示与进度复位", ok and reset,
+           "status=%r reset=%s" % (status_after, reset))
+
+    # 6c. 连续切换来源后 _dir_loading 计数归零（无泄漏、无卡死忙碌态）
+    window.radio_moto.setChecked(True)
+    pump(80)
+    window.radio_lenovo.setChecked(True)
+    pump(80)
+    wait(lambda: window._dir_loading == 0, 180)
+    record("连续切换后加载计数归零", window._dir_loading == 0,
+           "_dir_loading=%d status=%r" % (window._dir_loading, window.tree_status.text()))
+
     passed = sum(1 for _n, o in results if o)
     summary = "定向测试: %d 项通过, %d 项失败" % (passed, len(results) - passed)
     try:
@@ -3007,17 +3036,28 @@ def run_targeted_test(window, log_path):
             handle.write(summary + "\n")
     except Exception:
         pass
-    print(summary, flush=True)
+    try:
+        print(summary, flush=True)
+    except UnicodeEncodeError:
+        pass
 
     # 停掉后台目录线程再退出（否则 QThread 被析构导致 0xC0000409）
+    still_running = False
     for worker in list(window._dir_threads):
         try:
             worker.stop()
             worker.quit()
-            worker.wait(1500)
+            if not worker.wait(1500):
+                still_running = True
         except Exception:
             pass
-    return passed == len(results)
+    ok = passed == len(results)
+    if still_running:
+        # requests 卡 socket 无法中断：和 closeEvent 一样直接退出进程，
+        # 避免 QThread 运行中析构崩溃。日志已落盘，退出码用测试结果。
+        sys.stdout.flush()
+        os._exit(0 if ok else 1)
+    return ok
 
 
 def main():
@@ -3092,6 +3132,8 @@ def main():
         one_done = pyqtSignal(str, object, object, bool)  # url, dirs, files, need_placeholder
         done = pyqtSignal(str, object, object, str)       # 兼容：仅第 0 层
         failed = pyqtSignal(str, str)
+        one_progress = pyqtSignal(int, int)               # 已完成目录数, 已发现目录数
+        all_done = pyqtSignal(int, int)                   # 总目录数, 总文件数
 
         def __init__(self, url, proxy, depth=PREFETCH_DEPTH, parent=None):
             super(DirFetch, self).__init__(parent)
@@ -3116,6 +3158,10 @@ def main():
 
                 current = [(self._url, 0)]
                 seen = set()
+                total_dirs = 0
+                total_files = 0
+                completed = 0
+                cancelled = False
                 while current and not core.cancel.is_set():
                     next_level = []
                     futures = {}
@@ -3124,9 +3170,11 @@ def main():
                             continue
                         seen.add(url)
                         futures[executor.submit(core.list_dir, url)] = (url, level)
+                    self.one_progress.emit(completed, len(seen))
 
                     for future in as_completed(futures):
                         if core.cancel.is_set():
+                            cancelled = True
                             break
                         url, level = futures[future]
                         try:
@@ -3138,6 +3186,11 @@ def main():
                                 self.failed.emit(url, str(exc))
                             continue
 
+                        completed += 1
+                        total_dirs += len(dirs)
+                        total_files += len(files)
+                        self.one_progress.emit(completed, len(seen))
+
                         # 最后一层不再向下抓，给它的子目录挂占位项，供继续展开
                         need_placeholder = level + 1 >= self._depth
                         self.one_done.emit(url, dirs, files, need_placeholder)
@@ -3148,9 +3201,13 @@ def main():
                             for _name, href in dirs:
                                 if href not in seen:
                                     next_level.append((href, level + 1))
+                    if cancelled:
+                        break
                     current = next_level
 
                 executor.shutdown(wait=False)
+                if not cancelled and not core.cancel.is_set():
+                    self.all_done.emit(total_dirs, total_files)
             except CancelledError:
                 pass
             except Exception as exc:
@@ -3579,6 +3636,7 @@ def main():
             self.thread = None
             self._on_done = None
             self._dir_threads = []
+            self._dir_loading = 0
             self._last_speed = 0.0
             self._dark_theme = False
 
@@ -3661,6 +3719,10 @@ def main():
             search_row.addWidget(self.search_edit)
             search_row.addStretch()
             box.addLayout(search_row)
+
+            self.tree_status = QLabel("")
+            self.tree_status.setMinimumHeight(18)
+            box.addWidget(self.tree_status)
 
             self.tree = QTreeWidget()
             self.tree.setHeaderLabels(["目录", "大小"])
@@ -3903,6 +3965,10 @@ def main():
         @slot_guard
         def _on_source_changed(self, *_args):
             self.tree.clear()
+            self._dir_loading = 0
+            self.tree_status.setText("")
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
             self.browser_box.setVisible(True)
             self._load_tree_root()
 
@@ -3924,13 +3990,57 @@ def main():
             item.setData(0, Qt.UserRole + 1, True)
             loading = QTreeWidgetItem(item, ["加载中…", ""])
             loading.setData(0, Qt.UserRole, self.LOADING_MARK)
+
+            # 立即给出可见反馈：状态栏 + 进度条忙碌态
+            self._dir_loading += 1
+            self.tree_status.setText("正在加载目录…")
+            self.progress.setRange(0, 0)
+
             worker = DirFetch(url, self.proxy_dict(), PREFETCH_DEPTH, self)
             worker.one_done.connect(self._fill_prefetched)
             worker.failed.connect(self._dir_failed)
+            worker.one_progress.connect(self._dir_progress)
+            # 以“用户点击节点的首层加载完”为完成判据（整棵树 5 层可能要抓几百个
+            # 目录，等全部完成才提示会让进度条一直转）。更深层继续后台预加载。
+            worker.done.connect(self._dir_root_done)
+            worker._counted = False
+
+            def finalize():
+                if worker._counted:
+                    return
+                worker._counted = True
+                self._dir_finish_one()
+
+            worker.finished.connect(finalize)
             worker.finished.connect(worker.deleteLater)
             self._dir_threads = prune_finished_threads(self._dir_threads)
             self._dir_threads.append(worker)
             worker.start()
+
+        @slot_guard
+        def _dir_progress(self, done, found):
+            sender = self.sender()
+            if sender is not None and getattr(sender, "_counted", False):
+                return   # 该节点首层已完成，不让后台深层进度覆盖状态文案
+            self.tree_status.setText("正在加载目录… 已读取 %d 个目录" % done)
+
+        @slot_guard
+        def _dir_root_done(self, url, dirs, files, base):
+            sender = self.sender()
+            if sender is not None and getattr(sender, "_counted", False):
+                return
+            if sender is not None:
+                sender._counted = True
+            self.tree_status.setText(
+                "✓ 已加载 %d 个目录项（%d 个文件，深层后台预加载中…）"
+                % (len(dirs), len(files)))
+            self._dir_finish_one()
+
+        def _dir_finish_one(self):
+            self._dir_loading = max(0, self._dir_loading - 1)
+            if self._dir_loading == 0:
+                self.progress.setRange(0, 100)
+                self.progress.setValue(100)
 
         @slot_guard
         def _dir_failed(self, url, message):
@@ -3940,6 +4050,11 @@ def main():
                 target.setData(0, Qt.UserRole + 1, False)   # 允许重试
                 target._prefetched = False
             self.append_log("加载目录失败: %s" % message)
+            self.tree_status.setText("✗ 目录加载失败: %s" % message)
+            sender = self.sender()
+            if sender is not None and not getattr(sender, "_counted", False):
+                sender._counted = True
+                self._dir_finish_one()
 
         def _clear_loading(self, item):
             for index in range(item.childCount() - 1, -1, -1):
