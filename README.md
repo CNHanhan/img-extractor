@@ -44,7 +44,7 @@
   也可用 `--theme=dark` 命令行参数强制以深色启动
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
 
-> 当前版本 **v2.4.1** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本 **v2.4.2** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 临时文件在哪
 

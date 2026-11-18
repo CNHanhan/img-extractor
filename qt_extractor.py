@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.4.2"
 
 # 目录树：展开一个节点时向后预加载的层数与并发数（目录最深 5 层，一次拉满）
 PREFETCH_DEPTH = 5
@@ -2906,6 +2906,120 @@ def _ensure_qt_plugins():
             return
 
 
+def run_targeted_test(window, log_path):
+    """针对本次改动（v2.4.1）的定向测试：只覆盖改过的内容。
+
+    覆盖：预加载深度参数、删除的两个控件、来源切换、真实一次多层预加载。
+    用法：python qt_extractor.py --targeted-test=t.log
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    results = []
+    try:
+        open(log_path, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+
+    def record(name, ok, detail=""):
+        results.append((name, bool(ok)))
+        line = "%s %s%s" % ("PASS" if ok else "FAIL", name,
+                            (" | " + detail) if detail else "")
+        try:
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
+        print(line, flush=True)
+
+    def pump(ms):
+        end = time.monotonic() + ms / 1000.0
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.03)
+
+    def wait(pred, timeout):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            app.processEvents()
+            if pred():
+                return True
+            time.sleep(0.03)
+        return False
+
+    loading_mark = getattr(window, "LOADING_MARK", "__loading__")
+
+    def deepest_level(node, level=0):
+        if node is None:
+            return level - 1
+        best = level
+        for index in range(node.childCount()):
+            child = node.child(index)
+            if child.data(0, Qt.UserRole) == loading_mark:
+                continue
+            best = max(best, deepest_level(child, level + 1))
+        return best
+
+    pump(1200)
+
+    # 1. 改动的常量
+    record("预加载深度=5", PREFETCH_DEPTH == 5,
+           "DEPTH=%d WORKERS=%d" % (PREFETCH_DEPTH, PREFETCH_WORKERS))
+    record("版本号=2.4.2", APP_VERSION == "2.4.2", APP_VERSION)
+
+    # 2. 删除的控件
+    record("已删除『直接链接』单选", not hasattr(window, "radio_direct"))
+    record("已删除『加载固件』按钮",
+           not hasattr(window, "btn_load") and not hasattr(window, "load_selected_firmware"))
+
+    # 3. 来源切换控件
+    has_two = hasattr(window, "radio_moto") and hasattr(window, "radio_lenovo")
+    record("来源仅 Moto/Lenovo 且浏览器可见",
+           has_two and window.browser_box.isVisible())
+
+    # 4. 真实多层预加载：单层加载只到 level1，实测到 level3 即证明递归预加载生效
+    #    （目录实际结构 root/年/机型/子目录/文件，目录节点最深 level3，其下为 zip）
+    wait(lambda: window.tree.topLevelItem(0) is not None, 60)
+    ok = wait(lambda: deepest_level(window.tree.topLevelItem(0)) >= 3, 60)
+    depth = deepest_level(window.tree.topLevelItem(0))
+    record("一次点击递归预加载多层(>=3层目录节点)", ok,
+           "实测最深 level%d（root=0，无需逐层点击）" % depth)
+    record("预加载深度足以覆盖实际目录", PREFETCH_DEPTH >= 4,
+           "DEPTH=%d ≥ 实际目录最深3层" % PREFETCH_DEPTH)
+
+    # 5. 来源切换实跑
+    window.radio_lenovo.setChecked(True)
+    pump(1000)
+    lr = window.tree.topLevelItem(0)
+    lenovo_ok = lr is not None and "lenowow" in lr.text(0).lower()
+    window.radio_moto.setChecked(True)
+    pump(1000)
+    mr = window.tree.topLevelItem(0)
+    moto_ok = mr is not None and "lenomola" in mr.text(0).lower()
+    record("来源切换 Moto/Lenovo 重建树", lenovo_ok and moto_ok,
+           "lenovo=%s moto=%s" % (lenovo_ok, moto_ok))
+
+    passed = sum(1 for _n, o in results if o)
+    summary = "定向测试: %d 项通过, %d 项失败" % (passed, len(results) - passed)
+    try:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(summary + "\n")
+    except Exception:
+        pass
+    print(summary, flush=True)
+
+    # 停掉后台目录线程再退出（否则 QThread 被析构导致 0xC0000409）
+    for worker in list(window._dir_threads):
+        try:
+            worker.stop()
+            worker.quit()
+            worker.wait(1500)
+        except Exception:
+            pass
+    return passed == len(results)
+
+
 def main():
     if "--selftest" in sys.argv[1:]:
         sys.exit(run_selftest())
@@ -4089,9 +4203,16 @@ def main():
         QTimer.singleShot(1500, demo_expand_root)
 
     e2e_log = None
+    targeted_log = None
     for argument in sys.argv[1:]:
         if argument.startswith("--e2e="):
             e2e_log = argument.split("=", 1)[1]
+        elif argument.startswith("--targeted-test="):
+            targeted_log = argument.split("=", 1)[1]
+    if targeted_log:
+        ok = run_targeted_test(window, targeted_log)
+        application.quit()
+        sys.exit(0 if ok else 1)
     if e2e_log:
         ok = run_e2e(window, e2e_log)
         application.quit()
