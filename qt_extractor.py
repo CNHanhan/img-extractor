@@ -52,10 +52,13 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.4.3"
+APP_VERSION = "2.4.4"
 
-# 目录树：展开一个节点时向后预加载的层数与并发数（目录最深 5 层，一次拉满）
-PREFETCH_DEPTH = 5
+# 目录树：滑动窗口预取层数与并发数
+# 展开节点时预取「当前层 + 下一层」：用户展开到的每一层内容都已就绪=秒开，
+# 只有真正点进去的分支才继续预取，不浪费流量抓用户不看的分支。
+# 0=不限深度（会抓整棵树，几千请求，不要用）。
+PREFETCH_DEPTH = 2
 PREFETCH_WORKERS = 6
 
 # --------------------------------------------------------------------------- #
@@ -2968,9 +2971,9 @@ def run_targeted_test(window, log_path):
     pump(1200)
 
     # 1. 改动的常量
-    record("预加载深度=5", PREFETCH_DEPTH == 5,
+    record("预加载深度=滑动窗口(2)", PREFETCH_DEPTH == 2,
            "DEPTH=%d WORKERS=%d" % (PREFETCH_DEPTH, PREFETCH_WORKERS))
-    record("版本号=2.4.3", APP_VERSION == "2.4.3", APP_VERSION)
+    record("版本号=2.4.4", APP_VERSION == "2.4.4", APP_VERSION)
 
     # 2. 删除的控件
     record("已删除『直接链接』单选", not hasattr(window, "radio_direct"))
@@ -2982,15 +2985,33 @@ def run_targeted_test(window, log_path):
     record("来源仅 Moto/Lenovo 且浏览器可见",
            has_two and window.browser_box.isVisible())
 
-    # 4. 真实多层预加载：单层加载只到 level1，实测到 level3 即证明递归预加载生效
-    #    （目录实际结构 root/年/机型/子目录/文件，目录节点最深 level3，其下为 zip）
+    # 4. 滑动窗口：预取深度=2，加载完成后应有一个“已预取且内容就绪”的节点，
+    #    证明下一层已被提前抓好（展开秒开，不用再等网络）。
     wait(lambda: window.tree.topLevelItem(0) is not None, 60)
-    ok = wait(lambda: deepest_level(window.tree.topLevelItem(0)) >= 3, 60)
-    depth = deepest_level(window.tree.topLevelItem(0))
-    record("一次点击递归预加载多层(>=3层目录节点)", ok,
-           "实测最深 level%d（root=0，无需逐层点击）" % depth)
-    record("预加载深度足以覆盖实际目录", PREFETCH_DEPTH >= 4,
-           "DEPTH=%d ≥ 实际目录最深3层" % PREFETCH_DEPTH)
+    ok = wait(lambda: "已全部加载" in window.tree_status.text(), 120)
+    status_done = window.tree_status.text()
+
+    def ready_child_count(node=None):
+        """统计已预取(_prefetched=True)且已有真实子节点的节点数"""
+        node = node or (window.tree.topLevelItem(0) if window.tree.topLevelItemCount() else None)
+        if node is None:
+            return 0
+        count = 0
+        for i in range(node.childCount()):
+            child = node.child(i)
+            if child.data(0, Qt.UserRole) == loading_mark:
+                continue
+            real = sum(1 for j in range(child.childCount())
+                       if child.child(j).data(0, Qt.UserRole) != loading_mark)
+            if getattr(child, "_prefetched", False) and real > 0:
+                count += 1
+            count += ready_child_count(child)
+        return count
+
+    ready = ready_child_count()
+    record("滑动窗口预取下一层已就绪", ready > 0,
+           "已预取且内容就绪的节点数=%d" % ready)
+    record("全部加载完成提示", ok, "status=%r" % status_done)
 
     # 5. 来源切换实跑
     window.radio_lenovo.setChecked(True)
@@ -3013,8 +3034,8 @@ def run_targeted_test(window, log_path):
     record("目录加载即时提示", has_feedback,
            "status=%r" % status_during)
 
-    # 6b. 首层加载完成后立即显示“已加载”+ 进度条复位到 0-100
-    ok = wait(lambda: "已加载" in window.tree_status.text(), 120)
+    # 6b. 预取完成后显示“已全部加载” + 进度条复位到 0-100
+    ok = wait(lambda: "已全部加载" in window.tree_status.text(), 120)
     status_after = window.tree_status.text()
     reset = (window.progress.minimum() == 0 and window.progress.maximum() == 100)
     record("目录加载完成提示与进度复位", ok and reset,
@@ -3025,7 +3046,7 @@ def run_targeted_test(window, log_path):
     pump(80)
     window.radio_lenovo.setChecked(True)
     pump(80)
-    wait(lambda: window._dir_loading == 0, 180)
+    wait(lambda: window._dir_loading == 0, 90)
     record("连续切换后加载计数归零", window._dir_loading == 0,
            "_dir_loading=%d status=%r" % (window._dir_loading, window.tree_status.text()))
 
@@ -3122,11 +3143,12 @@ def main():
                 self.failed.emit("%s\n%s" % (exc, traceback.format_exc()))
 
     class DirFetch(QThread):
-        """展开一个目录时一次性预加载多层结构。
+        """展开一个目录时按滑动窗口预取 PREFETCH_DEPTH 层。
 
-        按层广度展开：第 0 层是用户点开的节点本身，之后逐层抓取子目录，
-        最多 PREFETCH_DEPTH 层。每层抓完立即 one_done 回主线程填树，
-        用户往下翻时下层目录已经就绪，不用再等网络。
+        第 0 层是用户点开的节点本身，之后逐层抓取子目录到指定深度。
+        到深度边界的子目录挂占位项（need_placeholder=True），用户展开时
+        再触发新一轮预取，窗口向前滚动。每层抓完 one_done 回主线程填树，
+        全部抓完发 all_done。
         """
 
         one_done = pyqtSignal(str, object, object, bool)  # url, dirs, files, need_placeholder
@@ -3139,7 +3161,8 @@ def main():
             super(DirFetch, self).__init__(parent)
             self._url = url
             self._proxy = proxy
-            self._depth = max(1, int(depth))
+            # 0 或负数表示不限深度；否则限制层数
+            self._depth = int(depth) if depth and depth > 0 else 0
             self._core = None
             self._executor = None
 
@@ -3191,8 +3214,8 @@ def main():
                         total_files += len(files)
                         self.one_progress.emit(completed, len(seen))
 
-                        # 最后一层不再向下抓，给它的子目录挂占位项，供继续展开
-                        need_placeholder = level + 1 >= self._depth
+                        # 不限深度时永远继续向下抓；有限深度时到边界挂占位项
+                        need_placeholder = bool(self._depth) and level + 1 >= self._depth
                         self.one_done.emit(url, dirs, files, need_placeholder)
                         if level == 0:
                             self.done.emit(url, dirs, files, _base)
@@ -3981,7 +4004,7 @@ def main():
 
         @slot_guard
         def fetch_children(self, item, url):
-            """展开/点击目录时请求预加载：一次抓取向下 PREFETCH_DEPTH 层。"""
+            """展开/点击目录时请求预加载：一次递归抓取到最深叶子层。"""
             if not url or not url.endswith("/"):
                 return
             if hasattr(item, "_prefetched") and item._prefetched:
@@ -4000,9 +4023,8 @@ def main():
             worker.one_done.connect(self._fill_prefetched)
             worker.failed.connect(self._dir_failed)
             worker.one_progress.connect(self._dir_progress)
-            # 以“用户点击节点的首层加载完”为完成判据（整棵树 5 层可能要抓几百个
-            # 目录，等全部完成才提示会让进度条一直转）。更深层继续后台预加载。
-            worker.done.connect(self._dir_root_done)
+            # 不限深度：整棵树全部抓完（all_done）才算完成
+            worker.all_done.connect(self._dir_all_done)
             worker._counted = False
 
             def finalize():
@@ -4021,20 +4043,18 @@ def main():
         def _dir_progress(self, done, found):
             sender = self.sender()
             if sender is not None and getattr(sender, "_counted", False):
-                return   # 该节点首层已完成，不让后台深层进度覆盖状态文案
-            self.tree_status.setText("正在加载目录… 已读取 %d 个目录" % done)
+                return
+            self.tree_status.setText("正在加载目录… 已读取 %d / 发现 %d 个目录" % (done, found))
 
         @slot_guard
-        def _dir_root_done(self, url, dirs, files, base):
-            sender = self.sender()
-            if sender is not None and getattr(sender, "_counted", False):
-                return
-            if sender is not None:
-                sender._counted = True
+        def _dir_all_done(self, dirs, files):
+            # 无论与 finished 谁先到，都要显示完成文案；计数只递减一次
             self.tree_status.setText(
-                "✓ 已加载 %d 个目录项（%d 个文件，深层后台预加载中…）"
-                % (len(dirs), len(files)))
-            self._dir_finish_one()
+                "✓ 已全部加载（%d 个目录项，%d 个文件）" % (dirs, files))
+            sender = self.sender()
+            if sender is not None and not getattr(sender, "_counted", False):
+                sender._counted = True
+                self._dir_finish_one()
 
         def _dir_finish_one(self):
             self._dir_loading = max(0, self._dir_loading - 1)
@@ -4078,8 +4098,8 @@ def main():
             for name, href in dirs:
                 child = QTreeWidgetItem(target, [name + "/", ""])
                 child.setData(0, Qt.UserRole, href)
-                # 下一层已在本次预加载任务里抓取 → 标记已加载避免重复抓；
-                # 到了最深层则保持未加载，用户展开时再触发新一轮预加载。
+                # 不限深度时子目录都已被抓取，标记已加载避免重复抓；
+                # 有限深度到边界时保持未加载，展开再触发新一轮预加载。
                 child._prefetched = not need_placeholder
                 child.setData(0, Qt.UserRole + 1, not need_placeholder)
             for name, href in files:
