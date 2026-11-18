@@ -17,8 +17,13 @@ libs/
 extracted_images/
 selftest.log
 extractor_error.log
+theme.txt
 
-# 调试截图与日志
+# 测试产物与截图
+e2e.log
+e2e_stdout.txt
+dark-mode.png
+ota-dialog.png
 gui_shot.png
 gui_window.png
 guitest.err

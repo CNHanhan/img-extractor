@@ -52,7 +52,11 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
+
+# 目录树：展开一个节点时向后预加载的层数与并发数
+PREFETCH_DEPTH = 3
+PREFETCH_WORKERS = 6
 
 # --------------------------------------------------------------------------- #
 # 主题（浅色 / 深色）
@@ -2480,6 +2484,23 @@ def run_e2e(window, log_path):
     else:
         record("展开机型目录", False, "没有机型节点")
 
+    # 4b. 三层预加载：根加载后应已预取到第三层（root→年→机型→内容），无需逐层点击等待
+    def deepest_level(node, level=0):
+        best = level
+        for index in range(node.childCount()):
+            child = node.child(index)
+            if child.data(0, Qt.UserRole) == loading_mark:
+                continue
+            best = max(best, deepest_level(child, level + 1))
+        return best
+
+    prefetch_level = 0
+    if root is not None:
+        wait(lambda: deepest_level(root) >= 3, 60)
+        prefetch_level = deepest_level(root)
+    record("一次点击预加载三层目录", prefetch_level >= 3,
+           "根节点已预取到第 %d 层（root/年/机型/内容）" % prefetch_level)
+
     # 5. 单击 zip 节点填充链接（机型目录下面还可能有子目录，逐层下钻）
     def find_zip_item():
         for node in window._walk_items():
@@ -2522,13 +2543,21 @@ def run_e2e(window, log_path):
     else:
         record("型号搜索", False, "无节点可搜")
 
-    # 7. 来源切换
-    window.radio_direct.setChecked(True)
-    pump(300)
-    hidden_on_direct = not window.browser_box.isVisible()
+    # 7. 来源切换（Moto <-> Lenovo，浏览器始终可见）
+    window.radio_lenovo.setChecked(True)
+    pump(1200)
+    lenovo_root = window.tree.topLevelItem(0)
+    lenovo_ok = (window.browser_box.isVisible()
+                 and lenovo_root is not None
+                 and "lenowow" in lenovo_root.text(0).lower())
     window.radio_moto.setChecked(True)
     pump(1200)
-    record("来源切换(直接链接隐藏浏览器)", hidden_on_direct and window.browser_box.isVisible())
+    moto_root = window.tree.topLevelItem(0)
+    moto_ok = (window.browser_box.isVisible()
+               and moto_root is not None
+               and "lenomola" in moto_root.text(0).lower())
+    record("来源切换(Moto/Lenovo浏览器可见)", lenovo_ok and moto_ok,
+           "来源=%s" % window.current_source())
 
     # 7b. 主题切换（真实点击按钮 + 截图）
     # 先强制归一到浅色（避免上次残留 theme.txt 为 dark 导致方向相反）
@@ -2939,24 +2968,75 @@ def main():
                 self.failed.emit("%s\n%s" % (exc, traceback.format_exc()))
 
     class DirFetch(QThread):
-        done = pyqtSignal(str, object, object, str)
+        """展开一个目录时一次性预加载多层结构。
+
+        按层广度展开：第 0 层是用户点开的节点本身，之后逐层抓取子目录，
+        最多 PREFETCH_DEPTH 层。每层抓完立即 one_done 回主线程填树，
+        用户往下翻时下层目录已经就绪，不用再等网络。
+        """
+
+        one_done = pyqtSignal(str, object, object, bool)  # url, dirs, files, need_placeholder
+        done = pyqtSignal(str, object, object, str)       # 兼容：仅第 0 层
         failed = pyqtSignal(str, str)
 
-        def __init__(self, url, proxy, parent=None):
+        def __init__(self, url, proxy, depth=PREFETCH_DEPTH, parent=None):
             super(DirFetch, self).__init__(parent)
             self._url = url
             self._proxy = proxy
+            self._depth = max(1, int(depth))
             self._core = None
+            self._executor = None
 
         def stop(self):
             if self._core is not None:
                 self._core.cancel.set()
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
 
         def run(self):
             try:
                 self._core = ExtractorCore(proxy=self._proxy)
-                dirs, files, base = self._core.list_dir(self._url)
-                self.done.emit(self._url, dirs, files, base)
+                core = self._core
+                self._executor = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
+                executor = self._executor
+
+                current = [(self._url, 0)]
+                seen = set()
+                while current and not core.cancel.is_set():
+                    next_level = []
+                    futures = {}
+                    for url, level in current:
+                        if url in seen:
+                            continue
+                        seen.add(url)
+                        futures[executor.submit(core.list_dir, url)] = (url, level)
+
+                    for future in as_completed(futures):
+                        if core.cancel.is_set():
+                            break
+                        url, level = futures[future]
+                        try:
+                            dirs, files, _base = future.result()
+                        except CancelledError:
+                            continue
+                        except Exception as exc:
+                            if level == 0:
+                                self.failed.emit(url, str(exc))
+                            continue
+
+                        # 最后一层不再向下抓，给它的子目录挂占位项，供继续展开
+                        need_placeholder = level + 1 >= self._depth
+                        self.one_done.emit(url, dirs, files, need_placeholder)
+                        if level == 0:
+                            self.done.emit(url, dirs, files, _base)
+
+                        if not need_placeholder:
+                            for _name, href in dirs:
+                                if href not in seen:
+                                    next_level.append((href, level + 1))
+                    current = next_level
+
+                executor.shutdown(wait=False)
             except CancelledError:
                 pass
             except Exception as exc:
@@ -3444,9 +3524,8 @@ def main():
             top.addWidget(QLabel("固件来源:"))
             self.radio_moto = QRadioButton("Lenomola (Moto)")
             self.radio_lenovo = QRadioButton("Lenowow (Lenovo)")
-            self.radio_direct = QRadioButton("直接链接")
             self.radio_moto.setChecked(True)
-            for radio in (self.radio_moto, self.radio_lenovo, self.radio_direct):
+            for radio in (self.radio_moto, self.radio_lenovo):
                 top.addWidget(radio)
                 radio.toggled.connect(self._on_source_changed)
             top.addStretch()
@@ -3487,9 +3566,6 @@ def main():
             self.btn_xiaomi.setToolTip("从 HyperData 机型库选择小米/HyperOS 固件")
             self.btn_xiaomi.clicked.connect(self.start_fetch_xiaomi)
             url_row.addWidget(self.btn_xiaomi)
-            self.btn_load = QPushButton("加载固件")
-            self.btn_load.clicked.connect(self.load_selected_firmware)
-            url_row.addWidget(self.btn_load)
             self.url_edit = QLineEdit()
             self.url_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             url_row.addWidget(self.url_edit)
@@ -3532,7 +3608,7 @@ def main():
             self.speed_label = QLabel("就绪")
             root.addWidget(self.speed_label)
 
-            for button in (self.btn_ota, self.btn_load, self.btn_list, self.btn_extract,
+            for button in (self.btn_ota, self.btn_list, self.btn_extract,
                            self.btn_cancel):
                 button.setMinimumHeight(28)
 
@@ -3660,7 +3736,7 @@ def main():
 
         def set_busy(self, busy):
             for button in (self.btn_ota, self.btn_xiaomi, self.btn_list,
-                           self.btn_extract, self.btn_load):
+                           self.btn_extract):
                 button.setEnabled(not busy)
             self.btn_cancel.setEnabled(busy)
             if busy:
@@ -3708,27 +3784,16 @@ def main():
         # -- 目录树 ----------------------------------------------------- #
 
         def current_source(self):
-            if self.radio_moto.isChecked():
-                return "lenomola"
-            if self.radio_lenovo.isChecked():
-                return "lenowow"
-            return "direct"
+            return "lenomola" if self.radio_moto.isChecked() else "lenowow"
 
         @slot_guard
         def _on_source_changed(self, *_args):
-            source = self.current_source()
             self.tree.clear()
-            if source == "direct":
-                self.browser_box.setVisible(False)
-                return
             self.browser_box.setVisible(True)
             self._load_tree_root()
 
         def _load_tree_root(self):
             source = self.current_source()
-            if source == "direct":
-                self.browser_box.setVisible(False)
-                return
             base = "%s/%s/" % (LOLINET_BASE, source)
             root_item = QTreeWidgetItem(self.tree, [source, ""])
             root_item.setData(0, Qt.UserRole, base)
@@ -3736,15 +3801,17 @@ def main():
 
         @slot_guard
         def fetch_children(self, item, url):
-            if not url or item.childCount() > 0 or item.data(0, Qt.UserRole + 1):
+            """展开/点击目录时请求预加载：一次抓取向下 PREFETCH_DEPTH 层。"""
+            if not url or not url.endswith("/"):
                 return
-            if not url.endswith("/"):
+            if hasattr(item, "_prefetched") and item._prefetched:
                 return
+            item._prefetched = True
             item.setData(0, Qt.UserRole + 1, True)
             loading = QTreeWidgetItem(item, ["加载中…", ""])
             loading.setData(0, Qt.UserRole, self.LOADING_MARK)
-            worker = DirFetch(url, self.proxy_dict(), self)
-            worker.done.connect(self._fill_children)
+            worker = DirFetch(url, self.proxy_dict(), PREFETCH_DEPTH, self)
+            worker.one_done.connect(self._fill_prefetched)
             worker.failed.connect(self._dir_failed)
             worker.finished.connect(worker.deleteLater)
             self._dir_threads = prune_finished_threads(self._dir_threads)
@@ -3757,6 +3824,7 @@ def main():
             if target is not None:
                 self._clear_loading(target)
                 target.setData(0, Qt.UserRole + 1, False)   # 允许重试
+                target._prefetched = False
             self.append_log("加载目录失败: %s" % message)
 
         def _clear_loading(self, item):
@@ -3772,16 +3840,19 @@ def main():
             return None
 
         @slot_guard
-        def _fill_children(self, url, dirs, files, base):
+        def _fill_prefetched(self, url, dirs, files, need_placeholder):
+            """每层抓完立即回填；被预加载出来的目录自动标为已加载，避免重复抓。"""
             target = self._find_item(url)
             if target is None:
                 return
             self._clear_loading(target)
-            if base and base != url:
-                target.setData(0, Qt.UserRole, base)   # 记住实际可用的镜像主机
             for name, href in dirs:
                 child = QTreeWidgetItem(target, [name + "/", ""])
                 child.setData(0, Qt.UserRole, href)
+                # 下一层已在本次预加载任务里抓取 → 标记已加载避免重复抓；
+                # 到了最深层则保持未加载，用户展开时再触发新一轮预加载。
+                child._prefetched = not need_placeholder
+                child.setData(0, Qt.UserRole + 1, not need_placeholder)
             for name, href in files:
                 child = QTreeWidgetItem(target, [name, ""])
                 child.setData(0, Qt.UserRole, href)
@@ -3811,19 +3882,6 @@ def main():
                 self.append_log("固件 URL 已填充: %s" % href)
             else:
                 item.setExpanded(True)
-
-        @slot_guard
-        def load_selected_firmware(self):
-            items = self.tree.selectedItems()
-            if not items:
-                self.append_log("请先在固件浏览器中选择一个固件")
-                return
-            href = items[0].data(0, Qt.UserRole)
-            if href and href.lower().split("?")[0].endswith(".zip"):
-                self.url_edit.setText(href)
-                self.append_log("固件 URL 已填充: %s" % href)
-            else:
-                self.append_log("当前选中的是目录，请展开后选择 zip 固件")
 
         @slot_guard
         def search_model(self):
