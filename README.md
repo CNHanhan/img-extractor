@@ -18,7 +18,12 @@
   - `cp1252`/`latin-1` 误解码的中文自动还原（`ç³»ç»Ÿ` → `系统`）
   - 预签名直链优先读 URL 里的 `response-content-disposition`，路径是 UUID 也能拿到真名
   - URL 里没有文件名时读响应头 `Content-Disposition`，再不行回退 `主机名_哈希`
-- **来源发现**：h5ai 镜像目录树懒加载（Lenomola / Lenowow）、Google OTA 机型-版本列表
+- **来源发现**：h5ai 镜像目录树懒加载（Lenomola / Lenowow）、Google OTA 机型-版本列表、
+  **小米 / HyperOS OTA 机型库**
+  - **小米 OTA**：点「小米 OTA」按钮，从 [HyperData](https://github.com/HegeKen/HyperData)
+    机型库（248 个机型）选品牌/机型/版本，自动拼出小米官方 `bn.d.miui.com` 直链；
+    版本按新→旧，只列可提取镜像的 `ota_full` 完整包
+    - 已适配小米 CDN 的三个坑：Referer 校验、HEAD 403（改用 Range GET 拿大小）、按请求数限速（单连接大块）
   - OTA 列表重排版：左侧机型列表（`Pixel 11 Pro XL — kodiak`，可筛选），右侧
     `版本` / `文件名` 两列，底部实时显示链接；页面上的冗长标题会被压成干净机型名
     （`Pixel 11 的代号为“cubs”` → `Pixel 11`）
@@ -35,7 +40,7 @@
   也可用 `--theme=dark` 命令行参数强制以深色启动
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
 
-> 当前版本 **v2.0.8** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本 **v2.1.0** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 临时文件在哪
 

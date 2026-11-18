@@ -1,5 +1,32 @@
 # 更新日志
 
+## v2.1.0 (2026-11-18)
+
+新增小米 / HyperOS OTA 镜像支持（数据源 [HyperData](https://github.com/HegeKen/HyperData)）。
+
+### 新增
+
+- **「小米 OTA」按钮**：打开机型浏览器，左侧机型列表（248 个，带筛选），
+  右侧版本列表（分支 + 版本号 + 发布日期 + 直链），单击选中即填入主界面链接框
+  - 数据源用 HyperData 的静态 JSON（经 jsDelivr CDN），比爬网页快得多、且不会因页面改版失效
+  - 版本按版本号从新到旧，只列 `ota_full`（payload 格式，可按需提取镜像），
+    忽略 `fastboot` 线刷包
+- **小米 CDN 适配**（三个实测坑）：
+  1. 直链必须带 `Referer: https://xiaomirom.com/`，否则 403 —— 已在所有请求里注入
+  2. CDN 用 HEAD 请求签名不匹配（403）—— `HeadAsGetSession` 把 HEAD 伪装成
+     1 字节 Range GET，从 `Content-Range` 拿真实大小
+  3. CDN 按请求数限速：并发多个 Range 会互相拖死，单连接大块反而最快 ——
+     小米源自动切**单连接 / 16MB 大块**
+  - CDN 节点自动使用 `bn.d.miui.com`（bigota 最容易被限流）
+
+### 测试
+
+- 自检 **42/42**（新增小米直链识别/拼接、已是完整 URL 不重复拼）
+- 端到端 **18 项通过 / 0 失败 / 1 跳过**（新增「小米 OTA(HyperData) 机型与版本」：
+  248 机型、筛选 K70→4、vermeer 95 个版本、选中直链正确）
+- **真实提取验证**：小米 `vermeer` 国行 OS3.0.308.0 完整包，
+  只下载 15.6 MB 数据段，产出 96 MB `boot.img`，`ANDROID!` 魔数校验通过
+
 ## v2.0.8 (2026-11-18)
 
 修复又一类预签名直链取不到真实文件名。

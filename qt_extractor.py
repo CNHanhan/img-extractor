@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.8"
+APP_VERSION = "2.1.0"
 
 # --------------------------------------------------------------------------- #
 # 主题（浅色 / 深色）
@@ -122,6 +122,12 @@ LOLINET_BASE = "https://mirrors.lolinet.com/firmware"
 # 官网按机型年份分流：2015-2019 -> mirrors-obs-2，2020-2021 -> mirrors-obs-1
 LOLINET_HOSTS = ("mirrors.lolinet.com", "mirrors-obs-1.lolinet.com",
                  "mirrors-obs-2.lolinet.com")
+XIAOMI_SERIES_URL = "https://xiaomirom.com/series/"
+XIAOMI_HOME = "https://xiaomirom.com/"
+# 小米 bigota 直链必须带 Referer 才允许下载（实测：仅 UA 会 403，仅 Referer 即 206）
+XIAOMI_REFERER = "https://xiaomirom.com/"
+# HyperData（hyperos.fans 数据仓库）：通过 jsDelivr CDN 访问，比爬网页快得多
+HYPERDATA_BASE = "https://cdn.jsdelivr.net/gh/HegeKen/HyperData@main"
 
 DEFAULT_WORKERS = 8
 CHUNK_SIZE = 8 * 1024 * 1024          # 单次 Range 请求最大字节数
@@ -634,7 +640,7 @@ class ParallelDownloader(object):
             try:
                 response = self._session().get(
                     self.url,
-                    headers={**HEADERS, "Range": "bytes=%d-%d" % (start, end)},
+                    headers=headers_for_url(self.url, {"Range": "bytes=%d-%d" % (start, end)}),
                     timeout=(HTTP_TIMEOUT, 180),
                 )
                 try:
@@ -930,6 +936,265 @@ def parse_ota_page(html_text):
     return devices
 
 
+# --------------------------------------------------------------------------- #
+# 小米 OTA 数据源一：HyperData（hyperos.fans 静态 JSON，经 jsDelivr CDN）
+# --------------------------------------------------------------------------- #
+
+def _hyperdata_get(core, path):
+    """从 HyperData 仓库读 JSON（jsDelivr CDN，国内可用）"""
+    session = core.new_session()
+    url = HYPERDATA_BASE + "/" + path.lstrip("/")
+    response = session.get(url, timeout=HTTP_TIMEOUT)
+    try:
+        if response.status_code != 200:
+            raise RuntimeError("HTTP %d (%s)" % (response.status_code, url))
+        return response.json()
+    finally:
+        response.close()
+
+
+def _version_key(label):
+    nums = re.findall(r"\d+", label or "")
+    return tuple(int(n) for n in nums[:5]) if nums else (0,)
+
+
+def fetch_hyperdata_devices(core):
+    """返回全部小米机型列表 [(code, 中文名, 英文名, brand), ...]"""
+    core.log("正在获取小米机型库（HyperData）...")
+    data = _hyperdata_get(core, "devices.json")
+    devices = []
+    for brand in ("mi", "redmi", "poco"):
+        group = data.get(brand) or {}
+        for item in group.get("devices", []):
+            name = item.get("name") or {}
+            devices.append((item.get("code", ""),
+                            name.get("zh") or name.get("en") or item.get("code", ""),
+                            name.get("en") or name.get("zh") or item.get("code", ""),
+                            brand))
+    core.log("小米机型: %d 个" % len(devices))
+    return devices
+
+
+def _hyperdata_direct_url(os_version, file_name):
+    """按 HyperData genlink.py 的规则拼小米官方直链"""
+    if not os_version or not file_name:
+        return None
+    if file_name.startswith("http"):
+        return file_name
+    return "https://bn.d.miui.com/%s/%s" % (os_version, file_name)
+
+
+def fetch_hyperdata_versions(core, code):
+    """返回某机型的版本列表 [(label, url, branch_name, release_date), ...]
+
+    label 格式：'正式版 OS3.0.308.0.WNKCNXM (2026-11-10)'
+    只取 recovery 字段（ota_full，payload 格式）；忽略 fastboot（images.tgz 线刷包）
+    """
+    data = _hyperdata_get(core, "devices/%s.json" % code)
+    result = []
+    for branch in data.get("branches", []):
+        branch_name = (branch.get("name") or {}).get("zh") or \
+                      (branch.get("name") or {}).get("en") or ""
+        for rom in (branch.get("roms") or {}).values():
+            os_version = rom.get("os", "")
+            recovery = rom.get("recovery", "")
+            url = _hyperdata_direct_url(os_version, recovery)
+            if not url or "ota_full" not in url.lower():
+                continue
+            release = rom.get("release", "")
+            label = "%s %s" % (os_version, ("(%s)" % release) if release else "")
+            result.append((label, url, branch_name, os_version))
+    # 按版本号从新到旧
+    result.sort(key=lambda item: _version_key(item[3]), reverse=True)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# 小米 OTA 数据源二：xiaomirom.com（网页爬取，作为兜底）
+# --------------------------------------------------------------------------- #
+
+def is_xiaomi_url(url):
+    """判断是不是小米官方 OTA 直链（需要特殊 Referer）"""
+    host = (urlsplit(url).hostname or "").lower()
+    return host.endswith(".d.miui.com") or host.endswith(".miui.com") \
+        or host.endswith("aliyuncs.com") and "miui-ota" in host
+
+
+def headers_for_url(url, base=None):
+    """某些站点的直链需要特定请求头：小米 bigota 要 Referer"""
+    headers = dict(base or HEADERS)
+    if is_xiaomi_url(url):
+        headers["Referer"] = XIAOMI_REFERER
+    return headers
+
+
+def parse_xiaomi_series(html_text, base_url=XIAOMI_HOME):
+    """解析 xiaomirom.com/series/ 的机型列表
+
+    页面结构：
+      <dt ...><a href=/series/dizi/>红米 Pad Pro / POCO Pad (dizi)</a> <span>362</span></dt>
+      <dd ...><a nav=/rom/xxx-indonesia-.../ href=... title="...印度尼西亚版...">印度尼西亚版</a>, ...
+    返回 [(group_name, [(region_name, rom_url), ...]), ...]
+    """
+    groups = []
+    for dt in re.finditer(r'<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>', html_text, re.I | re.S):
+        dt_html, dd_html = dt.group(1), dt.group(2)
+        name_match = re.search(r'<a[^>]+href=[^>]+>(.*?)</a>', dt_html, re.I | re.S)
+        group = re.sub(r"<[^>]+>", "", name_match.group(1) if name_match else "").strip()
+        group = html_mod.unescape(group)
+        roms = []
+        for href, title in re.findall(
+                r'<a[^>]+nav=(/rom/[^ ]+)[^>]*title="([^"]*)"',
+                dd_html, re.I):
+            label = html_mod.unescape(title)
+            # 去掉机型前缀，只留区域名，如 "印度尼西亚版 (印尼版) (ID)"
+            region = re.sub(r'^.*?\)\s*', "", label, count=1) if ")" in label else label
+            roms.append((region.strip() or label, urljoin(base_url, href)))
+        if group and roms:
+            # 同一 ROM 页可能重复出现，去重
+            seen = set()
+            unique = []
+            for item in roms:
+                if item[1] not in seen:
+                    seen.add(item[1])
+                    unique.append(item)
+            groups.append((group, unique))
+    return groups
+
+
+def _version_key(label):
+    """把 OS3.0.308.0.WNKCNXM / V14.0.3.0.TKLCNXM 变成可比较的元组，新的在前"""
+    nums = re.findall(r"\d+", label)
+    return tuple(int(n) for n in nums[:5]) if nums else (0,)
+
+
+def parse_xiaomi_versions(html_text, base_url=XIAOMI_HOME):
+    """解析 ROM 详情页的版本下载链接，按版本号从新到旧
+
+    页面里是：
+      <a href=/download/xxx-stable-OS3.0.308.0.WNKCNXM/#china-fastboot>下载</a>
+    返回 [(version_label, download_page_url), ...]
+    """
+    versions = []
+    seen = set()
+    for href in re.findall(r'href=["\x27]?(/download/[^"\x27 >#]+)', html_text, re.I):
+        full = urljoin(base_url, href)
+        if full in seen:
+            continue
+        seen.add(full)
+        slug = href.rstrip("/").rsplit("/", 1)[-1]
+        # 末尾的 stable-OSx.y.z... 就是版本号
+        match = re.search(r'(stable|beta|alpha)-(OS?[\d.]+[A-Z]+|[A-Z\d.]+)$', slug, re.I)
+        label = match.group(2) if match else slug
+        versions.append((label, full))
+    versions.sort(key=lambda item: _version_key(item[0]), reverse=True)
+    return versions
+
+
+def parse_xiaomi_direct_links(html_text):
+    """从版本下载页提取小米官方 OTA 直链，按可用性排序
+
+    只收 `ota_full` 完整 OTA（内含 payload.bin，可按需提取镜像）；
+    排除 `*_images_*` 线刷包（那是整包 tgz，不是我们要的）。
+    返回 [(label, url), ...]；bigota 优先，其余 CDN 作为备选
+    """
+    preferred = ("bigota.d.miui.com", "bn.d.miui.com", "cdnorg.d.miui.com",
+                 "oss-ap-southeast-1.aliyuncs.com", "hugeota.d.miui.com")
+    links = []
+    seen = set()
+    for url in re.findall(r'https?://[^\s"\x27<>\\)]+?\.(?:zip|tgz)', html_text, re.I):
+        url = url.rstrip(";,.)")
+        if not is_xiaomi_url(url) or url in seen:
+            continue
+        file_name = url.rsplit("/", 1)[-1]
+        if "ota_full" not in file_name.lower():
+            continue                      # 跳过线刷包 *_images_*.tgz
+        seen.add(url)
+        host = urlsplit(url).hostname or ""
+        label = next((pref for pref in preferred if pref in host), host)
+        links.append((label, url))
+    links.sort(key=lambda item: next(
+        (i for i, pref in enumerate(preferred) if pref in item[0]), 99))
+    return links
+
+
+def _xiaomi_get(core, url):
+    """xiaomirom.com 是 utf-8，但 requests 常误判成 latin-1，这里强制指定"""
+    session = core.new_session()
+    response = session.get(url, timeout=HTTP_TIMEOUT)
+    try:
+        if response.status_code != 200:
+            raise RuntimeError("HTTP %d" % response.status_code)
+        response.encoding = "utf-8"
+        return response.text
+    finally:
+        response.close()
+
+
+class HeadAsGetSession(object):
+    """包装 requests.Session：把 HEAD 改成 1 字节 Range GET
+
+    小米 bigota 的 AWS 签名只对 GET 有效，HEAD 返回 403；而 remotezip
+    用 HEAD 拿文件大小。这个包装让 HEAD 变成 `Range: bytes=0-0` 的 GET，
+    从 Content-Range 里解析出真实大小，伪装成带 Content-Length 的 HEAD 响应。
+    """
+
+    def __init__(self, session):
+        self._session = session
+
+    def head(self, url, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop("stream", None)
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers = headers_for_url(url, headers)
+        headers["Range"] = "bytes=0-0"
+        response = self._session.get(url, headers=headers, timeout=(HTTP_TIMEOUT, 60), **kwargs)
+        result = _SimpleHeadResponse(response)
+        return result
+
+    def get(self, url, **kwargs):
+        kwargs = dict(kwargs)
+        headers = kwargs.pop("headers", {}) or {}
+        kwargs["headers"] = headers_for_url(url, headers)
+        return self._session.get(url, **kwargs)
+
+
+class _SimpleHeadResponse(object):
+    def __init__(self, response):
+        self.headers = dict(response.headers)
+        content_range = response.headers.get("Content-Range", "")
+        match = re.search(r"/\s*(\d+)", content_range)
+        if match:
+            self.headers["Content-Length"] = match.group(1)
+        self.status_code = response.status_code
+        self._response = response
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            self._response.raise_for_status()
+
+    def close(self):
+        self._response.close()
+
+
+def fetch_xiaomi_series(core):
+    core.log("正在获取小米机型列表...")
+    groups = parse_xiaomi_series(_xiaomi_get(core, XIAOMI_SERIES_URL), XIAOMI_HOME)
+    if not groups:
+        raise RuntimeError("未解析到小米机型")
+    core.log("小米机型: %d 组, %d 个区域 ROM" %
+             (len(groups), sum(len(roms) for _, roms in groups)))
+    return groups
+
+
+def fetch_xiaomi_versions(core, rom_url):
+    return parse_xiaomi_versions(_xiaomi_get(core, rom_url), XIAOMI_HOME)
+
+
+def fetch_xiaomi_direct_links(core, version_url):
+    return parse_xiaomi_direct_links(_xiaomi_get(core, version_url))
+
+
 def fetch_ota_devices(core):
     session = core.new_session()
     core.log("正在获取 OTA 列表...")
@@ -999,18 +1264,20 @@ class ExtractorCore(object):
         if self.cancel.is_set():
             raise CancelledError("已取消")
 
-    def new_session(self):
+    def new_session(self, url=None):
         session = requests.Session()
         session.headers.update(HEADERS)
         session.verify = False
         session.trust_env = False
+        if url and is_xiaomi_url(url):
+            session.headers.update(headers_for_url(url))
         if self.proxy:
             session.proxies.update(self.proxy)
         return session
 
     @staticmethod
     def _range_get(session, url, start, end):
-        response = session.get(url, headers={**HEADERS, "Range": "bytes=%d-%d" % (start, end)},
+        response = session.get(url, headers=headers_for_url(url, {"Range": "bytes=%d-%d" % (start, end)}),
                                timeout=(HTTP_TIMEOUT, 180))
         try:
             if response.status_code not in (206, 200):
@@ -1057,8 +1324,11 @@ class ExtractorCore(object):
         info = {"url": url, "names": [], "sizes": {}, "is_payload": False,
                 "payload_zip_offset": 0, "data_offset": 0, "dam": None,
                 "version": 0, "block_size": 0}
-        session = self.new_session()
-        with RemoteZip(url, session=session) as remote_zip:
+        session = self.new_session(url)
+        rz_session = HeadAsGetSession(session) if is_xiaomi_url(url) else session
+        # 小米 CDN 不支持 suffix range（bytes=-N），必须给明确字节范围
+        rz_kwargs = {"support_suffix_range": False} if is_xiaomi_url(url) else {}
+        with RemoteZip(url, session=rz_session, **rz_kwargs) as remote_zip:
             names = remote_zip.namelist()
             info["names"] = names
             for name in names:
@@ -1182,10 +1452,19 @@ class ExtractorCore(object):
         self.dl_started = time.monotonic()
         self.dl_finished = 0.0
         self.speed.reset()
+        # 小米 CDN 按“请求数”限速：并发多个 Range 会互相拖死（实测并发 2 个时
+        # 每个 30s 只回 1/4），而单连接大块反而最快（8MB≈350KB/s > 1MB≈100KB/s）。
+        # 所以小米源强制单连接 + 大块；普通源保持高并发。
+        if is_xiaomi_url(url):
+            x_chunk, x_workers = 16 * 1024 * 1024, 1
+            self.log("检测到小米 CDN：自动切换单连接 / 16MB 大块（规避按请求数限速）")
+        else:
+            x_chunk, x_workers = CHUNK_SIZE, self.workers
         downloader = ParallelDownloader(
             url=url,
             session_factory=self.new_session,
-            workers=self.workers,
+            workers=x_workers,
+            chunk_size=x_chunk,
             log=self.log,
             on_progress=self._on_download_progress,
             cancel=self.cancel,
@@ -1284,8 +1563,10 @@ class ExtractorCore(object):
             parent = os.path.dirname(out_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            session = self.new_session()
-            with RemoteZip(url, session=session) as remote_zip:
+            session = self.new_session(url)
+            rz_session = HeadAsGetSession(session) if is_xiaomi_url(url) else session
+            rz_kwargs = {"support_suffix_range": False} if is_xiaomi_url(url) else {}
+            with RemoteZip(url, session=rz_session, **rz_kwargs) as remote_zip:
                 with remote_zip.open(name) as source, open(out_path, "wb") as sink:
                     while True:
                         chunk = source.read(CHUNK_SIZE)
@@ -1505,6 +1786,18 @@ def run_selftest():
                     handle.write(original_theme)
         except Exception:
             pass
+
+    # 0b) HyperData 小米数据源（离线合成 JSON）--------------------------- #
+    check("小米直链识别",
+          is_xiaomi_url("https://bn.d.miui.com/OS3.0.1/x.zip")
+          and is_xiaomi_url("https://bigota.d.miui.com/a.zip")
+          and not is_xiaomi_url("https://google.com/x.zip"))
+    check("小米直链拼接",
+          _hyperdata_direct_url("OS3.0.308.0.WNKCNXM", "vermeer-ota_full-x.zip")
+          == "https://bn.d.miui.com/OS3.0.308.0.WNKCNXM/vermeer-ota_full-x.zip")
+    check("小米直链-已是完整 URL",
+          _hyperdata_direct_url("OS1.0", "https://other.com/x.zip")
+          == "https://other.com/x.zip")
 
     # 1) 目录名推导 --------------------------------------------------- #
     name_cases = [
@@ -2048,6 +2341,52 @@ def run_e2e(window, log_path):
             except Exception:
                 pass
 
+    # 8c. 小米 OTA（HyperData 数据源）：真实拉机型库 + 对话框选版本
+    xiaomi_dialog = None
+    try:
+        core_x = window.make_core()
+        devices = fetch_hyperdata_devices(core_x)
+        xiaomi_dialog = window.xiaomi_dialog_class(window, core_x, devices)
+        labels = [xiaomi_dialog.device_list.item(i).text()
+                  for i in range(xiaomi_dialog.device_list.count())]
+        xiaomi_dialog.filter_edit.setText("K70")
+        pump(250)
+        filtered = xiaomi_dialog.device_list.count()
+        xiaomi_dialog.filter_edit.setText("vermeer")
+        pump(250)
+        # 选中 vermeer 机型，加载版本
+        vermeer_row = -1
+        for i in range(xiaomi_dialog.device_list.count()):
+            if "vermeer" in xiaomi_dialog.device_list.item(i).text().lower():
+                vermeer_row = i
+                break
+        if vermeer_row >= 0:
+            xiaomi_dialog.device_list.setCurrentRow(vermeer_row)
+            wait(lambda: xiaomi_dialog.version_tree.topLevelItemCount() > 0, 120)
+        rows = xiaomi_dialog.version_tree.topLevelItemCount()
+        first_url = ""
+        if rows:
+            item0 = xiaomi_dialog.version_tree.topLevelItem(0)
+            first_url = item0.data(0, Qt.UserRole) or ""
+            xiaomi_dialog.version_tree.setCurrentItem(item0)
+            xiaomi_dialog._accept_selection()
+        chosen = xiaomi_dialog.chosen or ""
+        xiaomi_dialog.close()
+        xiaomi_dialog = None
+        record("小米 OTA(HyperData) 机型与版本",
+               len(devices) > 100 and len(labels) == len(devices)
+               and 0 < filtered < len(devices) and rows > 0
+               and "miui.com" in first_url and chosen == first_url,
+               "机型 %d，筛选 K70→%d，vermeer 版本 %d，选中 %s" % (
+                   len(devices), filtered, rows, chosen.rsplit("/", 1)[-1][:36]))
+    except Exception as exc:
+        record("小米 OTA(HyperData) 机型与版本", False, str(exc)[:140])
+        if xiaomi_dialog is not None:
+            try:
+                xiaomi_dialog.close()
+            except Exception:
+                pass
+
     # 9. 解析真实 Full OTA
     rate_limited = False
     window.url_edit.setText(REAL_OTA_URL)
@@ -2287,6 +2626,148 @@ def main():
             except Exception as exc:
                 self.failed.emit(self._url, str(exc))
 
+    class XiaomiDialog(QDialog):
+        """小米 OTA 选择框：左机型（可筛选），右版本（分支 + 日期 + 直链）"""
+
+        def __init__(self, parent, core, devices):
+            super(XiaomiDialog, self).__init__(parent)
+            self.setWindowTitle("小米 OTA（HyperData 机型库）")
+            self.resize(1050, 600)
+            self.core = core
+            self.devices = devices
+            self.chosen = None
+            self._versions = []
+            self._device_index = []
+            self._version_cache = {}
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+
+            filter_row = QHBoxLayout()
+            filter_row.addWidget(QLabel("筛选机型:"))
+            self.filter_edit = QLineEdit()
+            self.filter_edit.setPlaceholderText("输入机型名或代号，例如 K70 / vermeer / 小米 15")
+            filter_row.addWidget(self.filter_edit, stretch=1)
+            self.status = QLabel("选中机型后加载版本…")
+            filter_row.addWidget(self.status)
+            layout.addLayout(filter_row)
+
+            body = QHBoxLayout()
+            self.device_list = QListWidget()
+            self.device_list.setFixedWidth(320)
+            body.addWidget(self.device_list)
+
+            right = QVBoxLayout()
+            self.version_tree = QTreeWidget()
+            self.version_tree.setHeaderLabels(["版本", "分支", "发布日期", "直链"])
+            self.version_tree.setRootIsDecorated(False)
+            self.version_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.version_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.version_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            self.version_tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+            right.addWidget(self.version_tree, stretch=1)
+
+            link_row = QHBoxLayout()
+            link_row.addWidget(QLabel("链接:"))
+            self.link_edit = QLineEdit()
+            self.link_edit.setReadOnly(True)
+            link_row.addWidget(self.link_edit, stretch=1)
+            right.addLayout(link_row)
+            body.addLayout(right, stretch=1)
+            layout.addLayout(body, stretch=1)
+
+            buttons = QHBoxLayout()
+            buttons.addStretch()
+            self.btn_choose = QPushButton("选择该版本")
+            self.btn_choose.setMinimumHeight(28)
+            self.btn_choose.clicked.connect(self._accept_selection)
+            self.btn_close = QPushButton("关闭")
+            self.btn_close.setMinimumHeight(28)
+            self.btn_close.clicked.connect(self.reject)
+            buttons.addWidget(self.btn_choose)
+            buttons.addWidget(self.btn_close)
+            layout.addLayout(buttons)
+
+            self.filter_edit.textChanged.connect(self._refresh_devices)
+            self.device_list.currentRowChanged.connect(self._on_device_changed)
+            self.version_tree.currentItemChanged.connect(self._on_version_changed)
+            self.version_tree.itemDoubleClicked.connect(lambda *_: self._accept_selection())
+            self._refresh_devices()
+
+        def _filtered(self):
+            keyword = self.filter_edit.text().strip().lower()
+            if not keyword:
+                return list(range(len(self.devices)))
+            return [i for i, device in enumerate(self.devices)
+                    if keyword in ("%s %s %s" % (
+                        device[1], device[2], device[0])).lower()]
+
+        def _refresh_devices(self, *_args):
+            self.device_list.blockSignals(True)
+            self.device_list.clear()
+            self._device_index = self._filtered()
+            for index in self._device_index:
+                code, zh, en, brand = self.devices[index]
+                label = zh if zh == en else "%s (%s)" % (zh, en)
+                item = QListWidgetItem("%s — %s" % (label, code))
+                item.setToolTip("%s / %s / %s" % (brand, zh, en))
+                self.device_list.addItem(item)
+            self.device_list.blockSignals(False)
+            if self._device_index:
+                self.device_list.setCurrentRow(0)
+            else:
+                self.version_tree.clear()
+                self.link_edit.clear()
+
+        @slot_guard
+        def _on_device_changed(self, row):
+            if row < 0 or row >= len(self._device_index):
+                return
+            code, zh, _en, _brand = self.devices[self._device_index[row]]
+            self.status.setText("正在加载 %s 的版本…" % zh)
+            self.version_tree.clear()
+            self.link_edit.clear()
+            self._versions = []
+            if code in self._version_cache:
+                self._fill_versions()
+                return
+            # 同步加载（json 小，jsDelivr 快）
+            try:
+                versions = fetch_hyperdata_versions(self.core, code)
+            except Exception as exc:
+                self.status.setText("加载失败: %s" % str(exc)[:60])
+                return
+            self._version_cache[code] = versions
+            self._versions = versions
+            self._fill_versions()
+
+        def _fill_versions(self):
+            dates = []
+            for label, url, branch, os_ver in self._versions:
+                match = re.search(r"\((\d{4}-\d{2}-\d{2})\)", label)
+                date = match.group(1) if match else ""
+                ver = label.split(" (")[0]
+                item = QTreeWidgetItem(self.version_tree, [ver, branch, date, url])
+                item.setData(0, Qt.UserRole, url)
+                item.setToolTip(3, url)
+                dates.append(date)
+            self.status.setText("%d 个版本" % len(self._versions))
+            if self.version_tree.topLevelItemCount():
+                self.version_tree.setCurrentItem(self.version_tree.topLevelItem(0))
+
+        def _on_version_changed(self, current, _previous=None):
+            if current is None:
+                return
+            self.link_edit.setText(current.data(0, Qt.UserRole) or "")
+
+        def _accept_selection(self):
+            item = self.version_tree.currentItem()
+            if item is None:
+                return
+            self.chosen = item.data(0, Qt.UserRole)
+            self.accept()
+
     class OtaDialog(QDialog):
         """OTA 下载链接选择框：左边机型（可筛选），右边版本 + 文件名"""
 
@@ -2515,6 +2996,10 @@ def main():
             self.btn_ota = QPushButton("获取 OTA 列表")
             self.btn_ota.clicked.connect(self.start_fetch_ota)
             url_row.addWidget(self.btn_ota)
+            self.btn_xiaomi = QPushButton("小米 OTA")
+            self.btn_xiaomi.setToolTip("从 HyperData 机型库选择小米/HyperOS 固件")
+            self.btn_xiaomi.clicked.connect(self.start_fetch_xiaomi)
+            url_row.addWidget(self.btn_xiaomi)
             self.btn_load = QPushButton("加载固件")
             self.btn_load.clicked.connect(self.load_selected_firmware)
             url_row.addWidget(self.btn_load)
@@ -2687,7 +3172,8 @@ def main():
             self.speed_label.setText("失败")
 
         def set_busy(self, busy):
-            for button in (self.btn_ota, self.btn_list, self.btn_extract, self.btn_load):
+            for button in (self.btn_ota, self.btn_xiaomi, self.btn_list,
+                           self.btn_extract, self.btn_load):
                 button.setEnabled(not busy)
             self.btn_cancel.setEnabled(busy)
             if busy:
@@ -2707,6 +3193,21 @@ def main():
         def start_fetch_ota(self):
             core = self.make_core()
             self.run_job(lambda: fetch_ota_devices(core), self.show_ota_dialog)
+
+        @slot_guard
+        def start_fetch_xiaomi(self):
+            core = self.make_core()
+            self.run_job(lambda: fetch_hyperdata_devices(core), self.show_xiaomi_dialog)
+
+        @slot_guard
+        def show_xiaomi_dialog(self, devices):
+            if not devices:
+                self.append_log("未获取到小米机型列表")
+                return
+            dialog = XiaomiDialog(self, self.make_core(), devices)
+            if dialog.exec_() == QDialog.Accepted and dialog.chosen:
+                self.url_edit.setText(dialog.chosen)
+                self.append_log("已选择小米 OTA 链接: %s" % dialog.chosen)
 
         @slot_guard
         def show_ota_dialog(self, devices):
@@ -2972,6 +3473,7 @@ def main():
                 os._exit(0)
 
     MainWindow.ota_dialog_class = OtaDialog
+    MainWindow.xiaomi_dialog_class = XiaomiDialog
     global _THEME_OVERRIDE
     _THEME_OVERRIDE = None
     for argument in sys.argv[1:]:
