@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.0.8"
 
 # --------------------------------------------------------------------------- #
 # 主题（浅色 / 深色）
@@ -415,9 +415,37 @@ def strip_archive_suffix(name):
     return name
 
 
+def _name_from_query_disposition(url):
+    """直接从 URL 查询串取 response-content-disposition 的文件名（零请求）"""
+    try:
+        values = parse_qs(urlsplit(url).query).get("response-content-disposition", [])
+    except Exception:
+        values = []
+    for value in values:
+        name = _name_from_cd_header(value)
+        if name:
+            return name
+    return ""
+
+
 def derive_folder_name(url, session=None, log=None):
-    """从直链推导输出目录名，解决乱码 / 空名 / download 之类伪文件名"""
+    """从直链推导输出目录名，解决乱码 / 空名 / download 之类伪文件名
+
+    优先级：URL 查询串里的 response-content-disposition（最权威，就是浏览器另存的名字）
+            > 路径里的真实文件名 > HEAD/GET 响应头 > 主机名_哈希兜底
+    """
     parts = urlsplit(url)
+
+    # ① 预签名直链的 response-content-disposition 就是服务器指定的下载名，
+    #    即使路径末段看着像“正常文件名”（UUID.zip）也应优先采用
+    query_name = _name_from_query_disposition(url)
+    if query_name:
+        cleaned = sanitize_name(strip_archive_suffix(_decode_segment(query_name)))
+        if cleaned and cleaned.lower() not in _FAKE_NAMES:
+            if log:
+                log("目录名取自 URL 的 response-content-disposition: %s" % cleaned)
+            return cleaned
+
     raw_segment = parts.path.rstrip("/").rsplit("/", 1)[-1] if parts.path.strip("/") else ""
     decoded = _decode_segment(raw_segment)
     name = sanitize_name(strip_archive_suffix(decoded))
@@ -1672,6 +1700,19 @@ def run_selftest():
         check("预签名取名(query 参数)",
               derive_folder_name(presigned) == "PLQ110_16.0.5.702",
               "got=%r" % derive_folder_name(presigned))
+
+        # 6b2) 路径是 UUID.zip（看着像真文件名）但 CD 参数另有真名 —— 必须取 CD
+        uuid_presigned = (
+            "https://cloudcube.telecomjs.com/PERSONCLOUD/"
+            "88a953fd-140f-4a96-98c6-8bb8f2648915.zip"
+            "?response-content-disposition=attachment%3Bfilename%3D"
+            "XT2171-3_CYPFQ_CMCC_12_S3RYA32.49-15-3_subsidy-DEFAULT_"
+            "regulatory-DEFAULT_CFC.xml.zip&X-Amz-Signature=abc")
+        expect_uuid = ("XT2171-3_CYPFQ_CMCC_12_S3RYA32.49-15-3_subsidy-DEFAULT_"
+                       "regulatory-DEFAULT_CFC.xml")
+        check("UUID 路径优先取 CD 文件名",
+              derive_folder_name(uuid_presigned) == expect_uuid,
+              "got=%r" % derive_folder_name(uuid_presigned))
 
         # 6c) HEAD 被拒（403）、只有 GET 头带文件名 -> 用 1 字节 Range GET 取名
         with open(os.path.join(tmpdir, "presign_hash"), "wb") as handle:

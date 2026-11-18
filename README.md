@@ -16,7 +16,8 @@
 - **目录名智能推导**：修掉直链提取时目录名乱码 / 变成 `download` / 变成空目录的问题
   - 百分号编码（UTF-8 / GBK）自动解码
   - `cp1252`/`latin-1` 误解码的中文自动还原（`ç³»ç»Ÿ` → `系统`）
-  - URL 里没有文件名时读 `Content-Disposition`，再不行回退 `主机名_哈希`
+  - 预签名直链优先读 URL 里的 `response-content-disposition`，路径是 UUID 也能拿到真名
+  - URL 里没有文件名时读响应头 `Content-Disposition`，再不行回退 `主机名_哈希`
 - **来源发现**：h5ai 镜像目录树懒加载（Lenomola / Lenowow）、Google OTA 机型-版本列表
   - OTA 列表重排版：左侧机型列表（`Pixel 11 Pro XL — kodiak`，可筛选），右侧
     `版本` / `文件名` 两列，底部实时显示链接；页面上的冗长标题会被压成干净机型名
@@ -34,7 +35,7 @@
   也可用 `--theme=dark` 命令行参数强制以深色启动
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
 
-> 当前版本 **v2.0.7** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本 **v2.0.8** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 临时文件在哪
 

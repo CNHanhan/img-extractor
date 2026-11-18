@@ -1,5 +1,34 @@
 # 更新日志
 
+## v2.0.8 (2026-11-18)
+
+修复又一类预签名直链取不到真实文件名。
+
+### 问题
+
+天翼云（cloudcube.telecomjs.com）的预签名直链路径末段是 UUID：
+
+```
+/PERSONCLOUD/88a953fd-140f-4a96-98c6-8bb8f2648915.zip?...&response-content-disposition=
+attachment;filename=XT2171-3_CYPFQ_CMCC_12_S3RYA32.49-15-3_subsidy-DEFAULT_regulatory-DEFAULT_CFC.xml.zip
+```
+
+路径里的 `88a953fd-...zip` **带 `.zip`**，旧逻辑判定它“像个合法文件名”就不去查
+`response-content-disposition`，结果目录名成了那串 UUID。
+
+### 修复
+
+- 新增 `_name_from_query_disposition()`，`derive_folder_name()` 现在**优先**采用 URL 查询串里
+  `response-content-disposition` 指定的名字（它就是浏览器“另存为”显示的名字），
+  路径文件名退居其次
+- 覆盖 `filename=` 与 `filename*=UTF-8''...` 两种写法
+- 真实链接实测：`XT2171-3_CYPFQ_CMCC_12_S3RYA32.49-15-3_subsidy-DEFAULT_regulatory-DEFAULT_CFC.xml`
+
+### 测试
+
+- 自检 **39/39**（新增「UUID 路径优先取 CD 文件名」用例）
+- 端到端 **17 项通过 / 0 失败**（Google 限流时相关项记 SKIP）
+
 ## v2.0.7 (2026-11-17)
 
 新增深色模式。
