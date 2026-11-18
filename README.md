@@ -20,12 +20,12 @@
   - URL 里没有文件名时读响应头 `Content-Disposition`，再不行回退 `主机名_哈希`
 - **来源发现**：h5ai 镜像目录树懒加载（Lenomola / Lenowow）、Google OTA 机型-版本列表、
   **小米 / HyperOS OTA 机型库**
-  - **小米 OTA**：点「小米 OTA」按钮，从 [HyperData](https://github.com/HegeKen/HyperData)
-    机型库（248 个机型）选品牌/机型/版本，自动拼出小米官方 `bn.d.miui.com` 直链；
-    版本按新→旧，只列可提取镜像的 `ota_full` 完整包
-    - 已适配小米 CDN 的三个坑：Referer 校验、HEAD 403（改用 Range GET 拿大小）、按请求数限速（单连接大块）
-    - **最新发布机型在顶端**：带最近更新日期的机型排最前，名字后标 `[新 MM-DD]`
-    - **最新 OTA 包在顶端**：版本按发布日期倒序
+  - **小米 OTA**：点「小米 OTA」按钮，从融合数据源（[HyperData](https://github.com/HegeKen/HyperData)
+    + [xiaomirom.com](https://xiaomirom.com/)）选机型/版本，自动拼出小米官方直链；
+    机型按品牌分组（小米 / REDMI / POCO），组内新机型在前
+    - **机型互补**：HyperData 有 180 个机型（更新快），xiaomirom.com 补漏 157 个 MIUI 老机型（标记 `[W]`），合计 337 个
+    - **下载节点优先第 4 个**：每个版本的 5 个下载直链里优先用阿里云 OSS（最稳），不足时回退
+    - **最新发布机型/最新包置顶**：带 `[新 MM-DD]` 的机型/版本排最顶端
   - OTA 列表重排版：左侧机型列表（`Pixel 11 Pro XL — kodiak`，可筛选），右侧
     `版本` / `文件名` 两列，底部实时显示链接；页面上的冗长标题会被压成干净机型名
     （`Pixel 11 的代号为“cubs”` → `Pixel 11`）
@@ -42,7 +42,7 @@
   也可用 `--theme=dark` 命令行参数强制以深色启动
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
 
-> 当前版本 **v2.1.1** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本 **v2.2.0** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 临时文件在哪
 
@@ -74,7 +74,9 @@
    链接自动填入主界面的链接框
 4. 回主界面点「**解析列表**」→ 勾选 `boot.img` 等分区 → 点「**开始提取**」
 
-> 新发布的机型（带 `[新 MM-DD]` 标记）排在机型列表最顶端，最新 OTA 包排在版本列表最顶端。
+> 新发布的机型（带 `[新 MM-DD]` 标记）排在机型分组最顶端，最新 OTA 包排在版本列表最顶端。
+> 机型来源：`[W]` 表示来自 xiaomirom.com 补漏的 MIUI 老机型，其余来自 HyperData。
+> 下载优先用页面第 4 个节点（阿里云 OSS，最稳）。
 > 小米 CDN 带宽较低，提取分区时会显示实时网速，属正常现象。
 
 ## 直接使用
