@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 # --------------------------------------------------------------------------- #
 # 主题（浅色 / 深色）
@@ -958,21 +958,64 @@ def _version_key(label):
     return tuple(int(n) for n in nums[:5]) if nums else (0,)
 
 
-def fetch_hyperdata_devices(core):
-    """返回全部小米机型列表 [(code, 中文名, 英文名, brand), ...]"""
+def fetch_hyperdata_recent(core):
+    """读 index.json 的 recent.roms，返回 {code: 'YYYY-MM-DD'}
+
+    这是 HyperData 官方维护的"最近收录/更新"日期，是机型级唯一的可靠时间字段。
+    失败时返回 {}，调用方退化为原顺序，不影响功能。
+    """
+    try:
+        data = _hyperdata_get(core, "index.json")
+        roms = (data.get("recent") or {}).get("roms") or {}
+        result = {}
+        for code, info in roms.items():
+            versions = info.get("versions") or []
+            dates = [v.get("insert_date", "") for v in versions if v.get("insert_date")]
+            if dates:
+                result[code] = max(dates)
+        core.log("最近更新机型: %d 个" % len(result))
+        return result
+    except Exception as exc:
+        core.log("读取最近更新列表失败(不影响机型加载): %s" % str(exc)[:60])
+        return {}
+
+
+def fetch_hyperdata_devices(core, recent=None):
+    """返回全部小米机型列表
+
+    [(code, 中文名, 英文名, brand, 最新日期), ...]
+    排序：有 recent 日期的机型按日期倒序排在最前（新机型顶端），
+          其余按 品牌(mi/redmi/poco) → 原始录入顺序。
+    """
     core.log("正在获取小米机型库（HyperData）...")
     data = _hyperdata_get(core, "devices.json")
+    recent = recent or {}
     devices = []
     for brand in ("mi", "redmi", "poco"):
         group = data.get(brand) or {}
-        for item in group.get("devices", []):
+        for order, item in enumerate(group.get("devices", [])):
             name = item.get("name") or {}
-            devices.append((item.get("code", ""),
-                            name.get("zh") or name.get("en") or item.get("code", ""),
-                            name.get("en") or name.get("zh") or item.get("code", ""),
-                            brand))
-    core.log("小米机型: %d 个" % len(devices))
+            code = item.get("code", "")
+            devices.append((code,
+                            name.get("zh") or name.get("en") or code,
+                            name.get("en") or name.get("zh") or code,
+                            brand, recent.get(code, ""), order))
+    # 新机型（有日期）在顶端；其余按品牌顺序
+    brand_order = {"mi": 0, "redmi": 1, "poco": 2}
+    devices.sort(key=lambda d: (
+        0 if d[4] else 1,                      # 有日期的排前面
+        _neg_date(d[4]) if d[4] else 0,        # 日期倒序
+        brand_order.get(d[3], 9), d[5]))
+    core.log("小米机型: %d 个（最近更新 %d 个已置顶）" % (len(devices), len(recent)))
     return devices
+
+
+def _neg_date(date_str):
+    """把 YYYY-MM-DD 变成可倒序的数值（越大越新，取负用于正序排列）"""
+    nums = re.findall(r"\d+", date_str or "")
+    if len(nums) >= 3:
+        return -(int(nums[0]) * 10000 + int(nums[1]) * 100 + int(nums[2]))
+    return 0
 
 
 def _hyperdata_direct_url(os_version, file_name):
@@ -1003,9 +1046,14 @@ def fetch_hyperdata_versions(core, code):
                 continue
             release = rom.get("release", "")
             label = "%s %s" % (os_version, ("(%s)" % release) if release else "")
-            result.append((label, url, branch_name, os_version))
-    # 按版本号从新到旧
-    result.sort(key=lambda item: _version_key(item[3]), reverse=True)
+            # 第 5 项带发布日期，供排序用（UI 只显示前 4 项）
+            result.append((label, url, branch_name, os_version, release))
+    # 发布日期优先（最新包顶端），同日期再按版本号
+    # 注意 reverse=True：有日期项标记 1（排在无日期的 0 前面），日期字符串本身正序即可
+    result.sort(key=lambda item: (
+        1 if item[4] else 0,
+        item[4] or "",
+        _version_key(item[3])), reverse=True)
     return result
 
 
@@ -1798,6 +1846,28 @@ def run_selftest():
     check("小米直链-已是完整 URL",
           _hyperdata_direct_url("OS1.0", "https://other.com/x.zip")
           == "https://other.com/x.zip")
+    check("日期倒序键", _neg_date("2026-11-16") < _neg_date("2026-11-10"))
+    # 有 recent 日期的机型应排在无日期机型之前，且日期新的在前
+    fake_recent = {"newA": "2026-11-16", "newB": "2026-11-10"}
+    fake_devices = [
+        ("old", "旧机型", "Old", "mi", "", 0),
+        ("newB", "较新机型", "NewB", "redmi", "2026-11-10", 0),
+        ("newA", "最新机型", "NewA", "mi", "2026-11-16", 0),
+    ]
+    check("机型按最近更新置顶",
+          [d[0] for d in sorted(fake_devices, key=lambda d: (
+              0 if d[4] else 1, _neg_date(d[4]) if d[4] else 0, d[5]))]
+          == ["newA", "newB", "old"])
+    # 版本按发布日期倒序（新包顶端）
+    fake_versions = [
+        ("OS1.0.9.0 (2026-01-01)", "u1", "b", "OS1.0.9.0", "2026-01-01"),
+        ("OS3.0.308.0 (2026-11-10)", "u2", "b", "OS3.0.308.0", "2026-11-10"),
+        ("OS2.0.1.0", "u3", "b", "OS2.0.1.0", ""),
+    ]
+    fake_versions.sort(key=lambda item: (
+        1 if item[4] else 0, item[4] or "", _version_key(item[3])), reverse=True)
+    check("版本按发布日期置顶", fake_versions[0][4] == "2026-11-10",
+          "首项日期=%s" % fake_versions[0][4])
 
     # 1) 目录名推导 --------------------------------------------------- #
     name_cases = [
@@ -2254,6 +2324,10 @@ def run_e2e(window, log_path):
     record("来源切换(直接链接隐藏浏览器)", hidden_on_direct and window.browser_box.isVisible())
 
     # 7b. 主题切换（真实点击按钮 + 截图）
+    # 先强制归一到浅色（避免上次残留 theme.txt 为 dark 导致方向相反）
+    if window._dark_theme:
+        window.btn_theme.click()
+        pump(250)
     window.btn_theme.click()  # 切到深色
     pump(300)
     dark_on = (window._dark_theme
@@ -2341,33 +2415,45 @@ def run_e2e(window, log_path):
             except Exception:
                 pass
 
-    # 8c. 小米 OTA（HyperData 数据源）：真实拉机型库 + 对话框选版本
+    # 8c. 小米 OTA（HyperData 数据源）：真实拉机型库 + 对话框选版本 + 双击/排序
     xiaomi_dialog = None
     try:
         core_x = window.make_core()
-        devices = fetch_hyperdata_devices(core_x)
+        recent = fetch_hyperdata_recent(core_x)
+        devices = fetch_hyperdata_devices(core_x, recent)
         xiaomi_dialog = window.xiaomi_dialog_class(window, core_x, devices)
         labels = [xiaomi_dialog.device_list.item(i).text()
                   for i in range(xiaomi_dialog.device_list.count())]
+        # 排序：首项应是带"新"标记的最近更新机型
+        first_label = labels[0] if labels else ""
+        sorted_new = "[新 " in first_label
+
         xiaomi_dialog.filter_edit.setText("K70")
         pump(250)
         filtered = xiaomi_dialog.device_list.count()
         xiaomi_dialog.filter_edit.setText("vermeer")
         pump(250)
-        # 选中 vermeer 机型，加载版本
+        # 双击机型（验证双击有反馈：会触发 currentRowChanged 加载 + itemDoubleClicked 提示）
         vermeer_row = -1
         for i in range(xiaomi_dialog.device_list.count()):
             if "vermeer" in xiaomi_dialog.device_list.item(i).text().lower():
                 vermeer_row = i
                 break
+        double_feedback = False
         if vermeer_row >= 0:
-            xiaomi_dialog.device_list.setCurrentRow(vermeer_row)
+            item = xiaomi_dialog.device_list.item(vermeer_row)
+            xiaomi_dialog.device_list.itemDoubleClicked.emit(item)
+            # 异步加载：等待版本树填充；期间 status 应有加载提示
             wait(lambda: xiaomi_dialog.version_tree.topLevelItemCount() > 0, 120)
+            double_feedback = ("✓" in xiaomi_dialog.status.text()
+                               or "版本" in xiaomi_dialog.status.text())
         rows = xiaomi_dialog.version_tree.topLevelItemCount()
         first_url = ""
+        newest_date = ""
         if rows:
             item0 = xiaomi_dialog.version_tree.topLevelItem(0)
             first_url = item0.data(0, Qt.UserRole) or ""
+            newest_date = item0.text(2)          # 发布日期列
             xiaomi_dialog.version_tree.setCurrentItem(item0)
             xiaomi_dialog._accept_selection()
         chosen = xiaomi_dialog.chosen or ""
@@ -2375,10 +2461,10 @@ def run_e2e(window, log_path):
         xiaomi_dialog = None
         record("小米 OTA(HyperData) 机型与版本",
                len(devices) > 100 and len(labels) == len(devices)
-               and 0 < filtered < len(devices) and rows > 0
-               and "miui.com" in first_url and chosen == first_url,
-               "机型 %d，筛选 K70→%d，vermeer 版本 %d，选中 %s" % (
-                   len(devices), filtered, rows, chosen.rsplit("/", 1)[-1][:36]))
+               and sorted_new and 0 < filtered < len(devices) and rows > 0
+               and double_feedback and "miui.com" in first_url and chosen == first_url,
+               "机型 %d(首项新=%s)，筛选 K70→%d，vermeer 版本 %d(最新%s)，双击反馈=%s" % (
+                   len(devices), sorted_new, filtered, rows, newest_date, double_feedback))
     except Exception as exc:
         record("小米 OTA(HyperData) 机型与版本", False, str(exc)[:140])
         if xiaomi_dialog is not None:
@@ -2639,10 +2725,18 @@ def main():
             self._versions = []
             self._device_index = []
             self._version_cache = {}
+            self._loader = None
+            self._current_code = None
 
             layout = QVBoxLayout(self)
             layout.setContentsMargins(12, 12, 12, 12)
             layout.setSpacing(8)
+
+            guide = QLabel(
+                "使用方法：① 单击/双击左侧机型 → ② 右侧双击版本（或点“选择该版本”）"
+                "→ ③ 回主界面点“解析列表”→“开始提取”")
+            guide.setWordWrap(True)
+            layout.addWidget(guide)
 
             filter_row = QHBoxLayout()
             filter_row.addWidget(QLabel("筛选机型:"))
@@ -2691,6 +2785,7 @@ def main():
 
             self.filter_edit.textChanged.connect(self._refresh_devices)
             self.device_list.currentRowChanged.connect(self._on_device_changed)
+            self.device_list.itemDoubleClicked.connect(self._on_device_double)
             self.version_tree.currentItemChanged.connect(self._on_version_changed)
             self.version_tree.itemDoubleClicked.connect(lambda *_: self._accept_selection())
             self._refresh_devices()
@@ -2708,10 +2803,12 @@ def main():
             self.device_list.clear()
             self._device_index = self._filtered()
             for index in self._device_index:
-                code, zh, en, brand = self.devices[index]
+                code, zh, en, brand, latest, _order = self.devices[index]
                 label = zh if zh == en else "%s (%s)" % (zh, en)
-                item = QListWidgetItem("%s — %s" % (label, code))
-                item.setToolTip("%s / %s / %s" % (brand, zh, en))
+                suffix = "  [新 %s]" % latest[5:] if latest else ""
+                item = QListWidgetItem("%s — %s%s" % (label, code, suffix))
+                item.setToolTip("%s / %s / %s%s" % (
+                    brand, zh, en, ("\n最近更新: " + latest) if latest else ""))
                 self.device_list.addItem(item)
             self.device_list.blockSignals(False)
             if self._device_index:
@@ -2721,38 +2818,88 @@ def main():
                 self.link_edit.clear()
 
         @slot_guard
+        def _on_device_double(self, item):
+            """双击机型：若版本没加载好就明确提示，并把焦点切到版本树"""
+            self.device_list.setCurrentItem(item)
+            if self.version_tree.topLevelItemCount() == 0:
+                self.status.setText("正在加载版本，请稍候…（首次需联网读取机型数据）")
+            else:
+                self.status.setText("已在右侧列出版本，双击任意版本即可填入链接")
+                self.version_tree.setFocus()
+
+        @slot_guard
         def _on_device_changed(self, row):
             if row < 0 or row >= len(self._device_index):
                 return
-            code, zh, _en, _brand = self.devices[self._device_index[row]]
-            self.status.setText("正在加载 %s 的版本…" % zh)
+            code, zh, _en, _brand, _latest, _order = self.devices[self._device_index[row]]
+            self._current_code = code
+            self.status.setText("正在加载 %s 的版本…（首次可能需要几秒）" % zh)
             self.version_tree.clear()
             self.link_edit.clear()
             self._versions = []
+            self.device_list.setEnabled(False)
+            self.btn_choose.setEnabled(False)
             if code in self._version_cache:
+                self._versions = self._version_cache[code]
                 self._fill_versions()
+                self.device_list.setEnabled(True)
+                self.btn_choose.setEnabled(True)
                 return
-            # 同步加载（json 小，jsDelivr 快）
-            try:
-                versions = fetch_hyperdata_versions(self.core, code)
-            except Exception as exc:
-                self.status.setText("加载失败: %s" % str(exc)[:60])
-                return
-            self._version_cache[code] = versions
-            self._versions = versions
-            self._fill_versions()
+            # 异步加载，避免阻塞主线程造成"假死/网卡了"的错觉
+            if self._loader is not None:
+                try:
+                    self._loader.quit()
+                    self._loader.wait(500)
+                except RuntimeError:
+                    pass
+
+            class Loader(QThread):
+                done = pyqtSignal(str, object)
+                failed = pyqtSignal(str, str)
+
+                def __init__(self, core, code):
+                    super(Loader, self).__init__()
+                    self._core, self._code = core, code
+
+                def run(self):
+                    try:
+                        self.done.emit(self._code,
+                                       fetch_hyperdata_versions(self._core, self._code))
+                    except Exception as exc:
+                        self.failed.emit(self._code, str(exc))
+
+            loader = Loader(self.core, code)
+            self._loader = loader
+
+            def on_done(loaded_code, versions):
+                if loaded_code != self._current_code:   # 丢弃过期结果，防止竞态
+                    return
+                self._version_cache[loaded_code] = versions
+                self._versions = versions
+                self._fill_versions()
+                self.device_list.setEnabled(True)
+                self.btn_choose.setEnabled(True)
+
+            def on_failed(loaded_code, message):
+                if loaded_code != self._current_code:
+                    return
+                self.status.setText("加载失败: %s —— 点其他机型可重试" % message[:50])
+                self.device_list.setEnabled(True)
+                self.btn_choose.setEnabled(True)
+
+            loader.done.connect(on_done)
+            loader.failed.connect(on_failed)
+            loader.finished.connect(loader.deleteLater)
+            loader.start()
 
         def _fill_versions(self):
-            dates = []
-            for label, url, branch, os_ver in self._versions:
-                match = re.search(r"\((\d{4}-\d{2}-\d{2})\)", label)
-                date = match.group(1) if match else ""
+            for label, url, branch, os_ver, release in self._versions:
                 ver = label.split(" (")[0]
-                item = QTreeWidgetItem(self.version_tree, [ver, branch, date, url])
+                item = QTreeWidgetItem(self.version_tree, [ver, branch, release, url])
                 item.setData(0, Qt.UserRole, url)
                 item.setToolTip(3, url)
-                dates.append(date)
-            self.status.setText("%d 个版本" % len(self._versions))
+            self.status.setText("✓ %s 共 %d 个版本（最新在上），双击版本即可填入链接"
+                                % (self._current_code or "", len(self._versions)))
             if self.version_tree.topLevelItemCount():
                 self.version_tree.setCurrentItem(self.version_tree.topLevelItem(0))
 
@@ -2764,8 +2911,11 @@ def main():
         def _accept_selection(self):
             item = self.version_tree.currentItem()
             if item is None:
+                self.status.setText("请先在右侧选择一个版本")
                 return
             self.chosen = item.data(0, Qt.UserRole)
+            self.status.setText("已选择：%s —— 回主界面点“解析列表”→“开始提取”"
+                                % item.text(0)[:40])
             self.accept()
 
     class OtaDialog(QDialog):
@@ -3197,7 +3347,10 @@ def main():
         @slot_guard
         def start_fetch_xiaomi(self):
             core = self.make_core()
-            self.run_job(lambda: fetch_hyperdata_devices(core), self.show_xiaomi_dialog)
+            def load():
+                recent = fetch_hyperdata_recent(core)
+                return fetch_hyperdata_devices(core, recent)
+            self.run_job(load, self.show_xiaomi_dialog)
 
         @slot_guard
         def show_xiaomi_dialog(self, devices):

@@ -24,6 +24,8 @@
     机型库（248 个机型）选品牌/机型/版本，自动拼出小米官方 `bn.d.miui.com` 直链；
     版本按新→旧，只列可提取镜像的 `ota_full` 完整包
     - 已适配小米 CDN 的三个坑：Referer 校验、HEAD 403（改用 Range GET 拿大小）、按请求数限速（单连接大块）
+    - **最新发布机型在顶端**：带最近更新日期的机型排最前，名字后标 `[新 MM-DD]`
+    - **最新 OTA 包在顶端**：版本按发布日期倒序
   - OTA 列表重排版：左侧机型列表（`Pixel 11 Pro XL — kodiak`，可筛选），右侧
     `版本` / `文件名` 两列，底部实时显示链接；页面上的冗长标题会被压成干净机型名
     （`Pixel 11 的代号为“cubs”` → `Pixel 11`）
@@ -40,7 +42,7 @@
   也可用 `--theme=dark` 命令行参数强制以深色启动
 - **镜像稀疏写入**：`seek + write` 天然稀疏，ZERO 分区几秒落盘、实际占用极小
 
-> 当前版本 **v2.1.0** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本 **v2.1.1** · 变更记录见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 临时文件在哪
 
@@ -62,6 +64,18 @@
 | `8` REPLACE_XZ | xz / lzma |
 | `14` ZSTD | zstd |
 | 其它（BSDIFF / PUFFDIFF / ZUCCHINI …） | 增量包，不支持，会明确报错 |
+
+## 小米 OTA 使用方法
+
+1. 点主界面「**小米 OTA**」按钮 → 打开机型浏览器
+2. 左侧筛选或单击/双击机型（如输入 `K70`），右侧会**异步加载**该机型的所有版本
+   （首次需联网几秒，status 会显示"正在加载…"，加载完显示"✓ 共 N 个版本"）
+3. 右侧按发布日期从新到旧列出版本，**双击任意版本**（或选中后点"选择该版本"），
+   链接自动填入主界面的链接框
+4. 回主界面点「**解析列表**」→ 勾选 `boot.img` 等分区 → 点「**开始提取**」
+
+> 新发布的机型（带 `[新 MM-DD]` 标记）排在机型列表最顶端，最新 OTA 包排在版本列表最顶端。
+> 小米 CDN 带宽较低，提取分区时会显示实时网速，属正常现象。
 
 ## 直接使用
 
@@ -138,6 +152,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 `build.ps1` 会把依赖和打包工作区放到 **ASCII 临时目录**再构建，最后只把 exe 拷回
 `dist\FirmwareExtractor.exe`——因为 PyInstaller 的 Qt 钩子与 onefile 引导器都不认
 中文路径，直接在中文目录构建会报 `Qt plugin directory ... does not exist!`。
+打包完成后还会自动拷一份到 **`E:\tools\A-IMG提取\FirmwareExtractor.exe`**（日常使用版）。
+若该程序正在运行导致无法覆盖，脚本会提示先关闭程序，dist 里的产物仍可用。
 
 手动等价命令（项目路径必须是纯 ASCII）：
 
@@ -147,7 +163,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
   --paths libs qt_extractor.py
 ```
 
-产物：`dist/FirmwareExtractor.exe`（约 57 MB）。
+产物：`dist/FirmwareExtractor.exe` 和 `E:\tools\A-IMG提取\FirmwareExtractor.exe`（各约 57 MB）。
 PyInstaller 的产物**不是逐字节可复现**的（内嵌时间戳），请用 `--selftest` 而不是哈希来验收。
 
 ## 文件说明
