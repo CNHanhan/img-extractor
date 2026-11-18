@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # --------------------------------------------------------------------------- #
 # 主题（浅色 / 深色）
@@ -128,6 +128,14 @@ XIAOMI_HOME = "https://xiaomirom.com/"
 XIAOMI_REFERER = "https://xiaomirom.com/"
 # HyperData（hyperos.fans 数据仓库）：通过 jsDelivr CDN 访问，比爬网页快得多
 HYPERDATA_BASE = "https://cdn.jsdelivr.net/gh/HegeKen/HyperData@main"
+# 小米 OTA 四个下载源（xiaomirom.com 页面上前 4 个 ota_full 直链的主机）
+XIAOMI_NODES = (
+    ("bigota", "bigota.d.miui.com"),
+    ("bn", "bn.d.miui.com"),
+    ("cdnorg", "cdnorg.d.miui.com"),
+    ("阿里云 OSS（推荐）", "bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com"),
+)
+XIAOMI_DEFAULT_NODE = 3
 
 DEFAULT_WORKERS = 8
 CHUNK_SIZE = 8 * 1024 * 1024          # 单次 Range 请求最大字节数
@@ -1018,6 +1026,37 @@ def _neg_date(date_str):
     return 0
 
 
+def xiaomi_node_url(url, node_index=XIAOMI_DEFAULT_NODE):
+    """把小米直链的主机换成指定下载源（保留路径和查询串）"""
+    if not url:
+        return url
+    index = node_index if 0 <= node_index < len(XIAOMI_NODES) else XIAOMI_DEFAULT_NODE
+    parts = urlsplit(url)
+    if not parts.hostname or ".miui.com" not in parts.hostname and "aliyuncs.com" not in parts.hostname:
+        return url                                  # 非小米主机，原样返回
+    host = XIAOMI_NODES[index][1]
+    netloc = host + ((":" + str(parts.port)) if parts.port else "")
+    return urlunsplit((parts.scheme or "https", netloc, parts.path, parts.query, parts.fragment))
+
+
+def device_generation(name):
+    """从机型名取代际数字：小米 17T→17，Xiaomi 18 Pro→18，Redmi Note 13→13"""
+    match = re.search(r"(?:小米|Xiaomi|Redmi|红米|POCO)[^\d]{0,12}(\d{1,2})", str(name or ""), re.I)
+    return int(match.group(1)) if match else 0
+
+
+def os_major(os_version):
+    """大版本排序权重：OS4→4，OS3→3，V14(MIUI)→-14，V13→-13"""
+    text = str(os_version or "").strip().upper()
+    match = re.match(r"OS(\d+)", text)
+    if match:
+        return int(match.group(1))
+    match = re.match(r"V(\d+)", text)
+    if match:
+        return -int(match.group(1))
+    return -100
+
+
 def _hyperdata_direct_url(os_version, file_name):
     """按 HyperData genlink.py 的规则拼小米官方直链"""
     if not os_version or not file_name:
@@ -1048,9 +1087,9 @@ def fetch_hyperdata_versions(core, code):
             label = "%s %s" % (os_version, ("(%s)" % release) if release else "")
             # 第 5 项带发布日期，供排序用（UI 只显示前 4 项）
             result.append((label, url, branch_name, os_version, release))
-    # 发布日期优先（最新包顶端），同日期再按版本号
-    # 注意 reverse=True：有日期项标记 1（排在无日期的 0 前面），日期字符串本身正序即可
+    # 大版本优先（OS4/澎湃4 在 OS3/澎湃3 上），同版本按发布日期，再按版本号
     result.sort(key=lambda item: (
+        os_major(item[3]),
         1 if item[4] else 0,
         item[4] or "",
         _version_key(item[3])), reverse=True)
@@ -1135,7 +1174,8 @@ def parse_xiaomi_versions(html_text, base_url=XIAOMI_HOME):
         match = re.search(r'(stable|beta|alpha)-(OS?[\d.]+[A-Z]+|[A-Z\d.]+)$', slug, re.I)
         label = match.group(2) if match else slug
         versions.append((label, full))
-    versions.sort(key=lambda item: _version_key(item[0]), reverse=True)
+    # 大版本优先（OS4 > OS3 > V14 MIUI），同级按版本号
+    versions.sort(key=lambda item: (os_major(item[0]), _version_key(item[0])), reverse=True)
     return versions
 
 
@@ -1316,15 +1356,17 @@ def fetch_all_xiaomi_devices(core):
     brand_order = {name: index for index, name in enumerate(_BRAND_KEYS)}
     devices.sort(key=lambda d: (
         brand_order.get(d[3], 9),       # 品牌分组
-        0 if d[4] else 1,               # 有更新日期的在前
-        _neg_date(d[4]) if d[4] else 0, # 日期倒序
+        -device_generation("%s %s" % (d[1], d[2])),  # 新机型代际在前：小米17 > 小米13
+        _neg_date(d[4]) if d[4] else 1, # 同代按最近更新
         d[5]))
     core.log("小米机型合计: %d 个（web 补漏 %d）" % (len(devices), web_added))
     return devices
 
 
-def fetch_all_xiaomi_versions(core, code, source="hyper", rom_url=""):
-    """统一版本获取：hyper 走 JSON；web 走 xiaomirom 页面 + 第4节点直链"""
+def fetch_all_xiaomi_versions(core, code, source="hyper", rom_url="",
+                              node_index=XIAOMI_DEFAULT_NODE):
+    """统一版本获取：hyper 走 JSON；web 走 xiaomirom 页面
+    node_index: 下载源索引 0=bigota 1=bn 2=cdnorg 3=阿里云OSS（默认）"""
     if source == "web" and rom_url:
         web_limit = 8                     # 只解析前 8 个版本（每个都要单独 GET 下载页）
         seen = set()
@@ -1341,13 +1383,13 @@ def fetch_all_xiaomi_versions(core, code, source="hyper", rom_url=""):
             version, page = item
             try:
                 links = fetch_xiaomi_direct_links(core, page)
-                chosen = pick_xiaomi_link(links, prefer_index=3)
+                chosen = pick_xiaomi_link(links, prefer_index=node_index)
                 if not chosen:
                     return None
                 label, url = chosen
-                short = "阿里云OSS" if "aliyuncs.com" in label else label
+                short = XIAOMI_NODES[node_index][0] if 0 <= node_index < len(XIAOMI_NODES) else label
                 return ("%s (%s)" % (version, short), url,
-                        "xiaomirom · 第4节点", version, "")
+                        "xiaomirom · 源%d" % (node_index + 1), version, "")
             except Exception:
                 return None
 
@@ -1357,7 +1399,12 @@ def fetch_all_xiaomi_versions(core, code, source="hyper", rom_url=""):
                 if result is not None:
                     versions.append(result)
         return versions
-    return fetch_hyperdata_versions(core, code)
+    versions = fetch_hyperdata_versions(core, code)
+    # HyperData 源也能切换下载节点：批量替换 URL 主机，零额外请求
+    result = []
+    for label, url, branch, os_ver, release in versions:
+        result.append((label, xiaomi_node_url(url, node_index), branch, os_ver, release))
+    return result
 
 
 def fetch_ota_devices(core):
@@ -2003,6 +2050,31 @@ def run_selftest():
         0 if d[4] else 1, _neg_date(d[4]) if d[4] else 0, d[5]))
     check("机型按品牌分组", [d[0] for d in brand_devs] == ["mi_new", "mi_a", "red_b", "poco_x"],
           " → ".join(d[0] for d in brand_devs))
+    # 机型按代际：小米17 在 小米13 前
+    check("机型代际识别", device_generation("小米 17T") == 17
+          and device_generation("Xiaomi 18 Pro") == 18
+          and device_generation("小米 13") == 13
+          and device_generation("红米 Pad Pro") == 0)
+    ordered_devs = [
+        ("m13", "小米 13", "Xiaomi 13", "mi", "", 0, "hyper", ""),
+        ("m17", "小米 17T", "Xiaomi 17T", "mi", "", 0, "hyper", ""),
+        ("m18", "小米 18 Pro", "Xiaomi 18 Pro", "mi", "", 0, "hyper", ""),
+    ]
+    ordered_devs.sort(key=lambda d: (
+        {"mi": 0}.get(d[3], 9), -device_generation("%s %s" % (d[1], d[2])),
+        _neg_date(d[4]) if d[4] else 1, d[5]))
+    check("新机型在上", [d[0] for d in ordered_devs] == ["m18", "m17", "m13"],
+          " → ".join(d[0] for d in ordered_devs))
+    # 大版本：OS4 > OS3 > V14(MIUI)
+    check("大版本排序", os_major("OS4.0.30.0.XFRCNXM") == 4
+          and os_major("OS3.0.308.0.WNKCNXM") == 3
+          and os_major("V14.0.12.0.TKICNXM") == -14
+          and os_major("OS4...") > os_major("OS3...") > os_major("V14..."))
+    # 四节点 URL 替换
+    base_url = "https://bn.d.miui.com/OS3.0.308.0/x-ota_full-abc.zip"
+    check("节点1 bigota", xiaomi_node_url(base_url, 0).startswith("https://bigota.d.miui.com/"))
+    check("节点4 阿里云OSS", "aliyuncs.com" in xiaomi_node_url(base_url, 3))
+    check("节点越界回退", "aliyuncs.com" in xiaomi_node_url(base_url, 99))
 
     # 1) 目录名推导 --------------------------------------------------- #
     name_cases = [
@@ -2611,18 +2683,38 @@ def run_e2e(window, log_path):
                     witem = xiaomi_dialog.version_tree.topLevelItem(0)
                     wurl = witem.data(0, Qt.UserRole) or ""
                     wbranch = witem.text(1)
-                    web_link_ok = ("aliyuncs.com" in wurl and "第4节点" in wbranch)
+                    web_link_ok = ("aliyuncs.com" in wurl and "源4" in wbranch)
+        # 节点切换验证：默认4(阿里云) → 切到1(bigota)，URL 主机应变化
+        node_switch_ok = False
+        if rows:
+            before = xiaomi_dialog.version_tree.topLevelItem(0).data(0, Qt.UserRole) or ""
+            xiaomi_dialog.node_combo.setCurrentIndex(0)   # 切到 bigota
+            pump(250)
+            after = xiaomi_dialog.version_tree.topLevelItem(0).data(0, Qt.UserRole) or ""
+            node_switch_ok = (before != after and "bigota.d.miui.com" in after
+                              and "源1" in xiaomi_dialog.version_tree.topLevelItem(0).text(1))
+        # 排序验证：首项代际 >= 末项代际（新机在上）
+        selectable = [d for i, d in enumerate(devices)
+                      if any(xiaomi_dialog.device_list.item(j).data(Qt.UserRole) == i
+                             for j in range(xiaomi_dialog.device_list.count()))]
+        gens = [device_generation("%s %s" % (d[1], d[2])) for d in devices]
+        gens_sorted = sorted(gens, reverse=True)
+        order_ok = all(devices[i][3] <= devices[i + 1][3] or
+                       (devices[i][3] == devices[i + 1][3]) for i in range(len(devices) - 1)) \
+                   and gens_sorted[:len(gens_sorted)//2] >= gens_sorted[len(gens_sorted)//2:]
         xiaomi_dialog.close()
         xiaomi_dialog = None
+        btn_text = window.btn_ota.text()
         record("小米 OTA 融合(H+W)",
                len(devices) > 250 and grouped and web_device is not None
                and web_marked and 0 < filtered < len(devices) and rows > 0
-               and double_feedback and "miui.com" in first_url and chosen == first_url
-               and web_link_ok,
-               "机型 %d(分组%d,web补漏%d)[W标记=%s]，筛选K70→%d，vermeer%d版，双击=%s，web第4节点=%s" % (
+               and double_feedback and first_url.startswith("https://") and chosen.endswith(".zip")
+               and web_link_ok and node_switch_ok and "谷歌" in btn_text,
+               "机型%d(分组%d,web%d)[W=%s]，vermeer%d版，双击=%s，web源4=%s，切换源1=%s，按钮=%s，chosen=%s first=%s" % (
                    len(devices), len(headers),
                    sum(1 for d in devices if len(d) > 6 and d[6] == "web"),
-                   web_marked, filtered, rows, double_feedback, web_link_ok))
+                   web_marked, rows, double_feedback, web_link_ok, node_switch_ok, btn_text,
+                   chosen[-28:] if chosen else "-", first_url[-28:] if first_url else "-"))
     except Exception as exc:
         record("小米 OTA 融合(H+W)", False, str(exc)[:140])
         if xiaomi_dialog is not None:
@@ -2893,9 +2985,20 @@ def main():
             guide = QLabel(
                 "使用方法：① 单击/双击左侧机型 → ② 右侧双击版本（或点“选择该版本”）"
                 "→ ③ 回主界面点“解析列表”→“开始提取”\n"
-                "机型来源：[H]=HyperData [W]=xiaomirom.com 补漏；版本优先取页面第 4 个下载节点（阿里云 OSS）")
+                "机型按发布时间排列（新机在上）；版本按澎湃大版本+发布时间排列。"
+                "来源 [H]=HyperData [W]=xiaomirom 补漏")
             guide.setWordWrap(True)
             layout.addWidget(guide)
+
+            node_row = QHBoxLayout()
+            node_row.addWidget(QLabel("下载源:"))
+            self.node_combo = QComboBox()
+            for label, host in XIAOMI_NODES:
+                self.node_combo.addItem("%s — %s" % (label, host))
+            self.node_combo.setCurrentIndex(XIAOMI_DEFAULT_NODE)
+            self.node_combo.setToolTip("选择版本的下载节点；切换后立即生效，默认第4个（阿里云 OSS 最稳）")
+            node_row.addWidget(self.node_combo, stretch=1)
+            layout.addLayout(node_row)
 
             filter_row = QHBoxLayout()
             filter_row.addWidget(QLabel("筛选机型:"))
@@ -2947,7 +3050,36 @@ def main():
             self.device_list.itemDoubleClicked.connect(self._on_device_double)
             self.version_tree.currentItemChanged.connect(self._on_version_changed)
             self.version_tree.itemDoubleClicked.connect(lambda *_: self._accept_selection())
+            self.node_combo.currentIndexChanged.connect(self._on_node_changed)
             self._refresh_devices()
+
+        @slot_guard
+        def _on_node_changed(self, index):
+            """切换下载源：已加载的版本只换 URL 主机/节点标签，不重新联网"""
+            name = XIAOMI_NODES[index][0] if 0 <= index < len(XIAOMI_NODES) else "默认"
+            if not self._versions:
+                self.status.setText("下载源已切到「%s」，选机型后生效" % name)
+                return
+            for row in range(self.version_tree.topLevelItemCount()):
+                item = self.version_tree.topLevelItem(row)
+                old_url = item.data(0, Qt.UserRole) or ""
+                new_url = xiaomi_node_url(old_url, index)
+                item.setText(3, new_url)
+                item.setData(0, Qt.UserRole, new_url)
+                item.setToolTip(3, new_url)
+                item.setText(1, "源%d · %s" % (index + 1, name))
+            # 同步更新缓存与当前 key，避免再次选机时读回旧节点
+            if isinstance(self._current_code, tuple) and len(self._current_code) == 3:
+                new_key = (self._current_code[0], self._current_code[1], index)
+                old_versions = self._version_cache.pop(self._current_code, None)
+                self._current_code = new_key
+                if old_versions is not None:
+                    refreshed = [(lbl, xiaomi_node_url(u, index), br, osv, rel)
+                                 for lbl, u, br, osv, rel in old_versions]
+                    self._version_cache[new_key] = refreshed
+                    self._versions = refreshed
+            self._on_version_changed(self.version_tree.currentItem())
+            self.status.setText("✓ 下载源已切到「%s」（源%d），链接已更新" % (name, index + 1))
 
         def _filtered(self):
             keyword = self.filter_edit.text().strip().lower()
@@ -3033,7 +3165,8 @@ def main():
             code, zh = dev[0], dev[1]
             source = dev[6] if len(dev) > 6 else "hyper"
             rom_url = dev[7] if len(dev) > 7 else ""
-            cache_key = (code, source)
+            node_index = self.node_combo.currentIndex()
+            cache_key = (code, source, node_index)
             self._current_code = cache_key
             self.status.setText("正在加载 %s 的版本…（首次可能需要几秒）" % zh)
             self.version_tree.clear()
@@ -3059,19 +3192,19 @@ def main():
                 done = pyqtSignal(tuple, object)
                 failed = pyqtSignal(tuple, str)
 
-                def __init__(self, core, key, src, url):
+                def __init__(self, core, key, src, url, node):
                     super(Loader, self).__init__()
                     self._core, self._key = core, key
-                    self._src, self._url = src, url
+                    self._src, self._url, self._node = src, url, node
 
                 def run(self):
                     try:
                         self.done.emit(self._key, fetch_all_xiaomi_versions(
-                            self._core, self._key[0], self._src, self._url))
+                            self._core, self._key[0], self._src, self._url, self._node))
                     except Exception as exc:
                         self.failed.emit(self._key, str(exc))
 
-            loader = Loader(self.core, cache_key, source, rom_url)
+            loader = Loader(self.core, cache_key, source, rom_url, node_index)
             self._loader = loader
 
             def on_done(key, versions):
@@ -3347,7 +3480,7 @@ def main():
             root.addWidget(self.browser_box)
 
             url_row = QHBoxLayout()
-            self.btn_ota = QPushButton("获取 OTA 列表")
+            self.btn_ota = QPushButton("谷歌 OTA")
             self.btn_ota.clicked.connect(self.start_fetch_ota)
             url_row.addWidget(self.btn_ota)
             self.btn_xiaomi = QPushButton("小米 OTA")
