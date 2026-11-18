@@ -52,10 +52,10 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 
-# 目录树：展开一个节点时向后预加载的层数与并发数
-PREFETCH_DEPTH = 3
+# 目录树：展开一个节点时向后预加载的层数与并发数（目录最深 5 层，一次拉满）
+PREFETCH_DEPTH = 5
 PREFETCH_WORKERS = 6
 
 # --------------------------------------------------------------------------- #
