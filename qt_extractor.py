@@ -52,7 +52,7 @@ from payload_extractor import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 APP_NAME = "固件远程提取工具"
-APP_VERSION = "2.4.4"
+APP_VERSION = "2.4.5"
 
 # 目录树：滑动窗口预取层数与并发数
 # 展开节点时预取「当前层 + 下一层」：用户展开到的每一层内容都已就绪=秒开，
@@ -1073,6 +1073,18 @@ def _hyperdata_direct_url(os_version, file_name):
     return "https://bn.d.miui.com/%s/%s" % (os_version, file_name)
 
 
+def is_flashable_ota(url):
+    """是不是可提取的卡刷完整包：HyperOS 的 *_ota_full-*.zip 或 MIUI 的 miui_*.zip。
+
+    排除 *_images_*.tgz 线刷包。HyperData 与 xiaomirom 两个源共用这套规则，
+    避免像小米13 那样"有澎湃有 MIUI，却因为只认 ota_full 而漏掉全部 MIUI 镜像"。
+    """
+    file_name = (url or "").rsplit("/", 1)[-1].lower()
+    if "_images_" in file_name or file_name.endswith(".tgz"):
+        return False
+    return "ota_full" in file_name or file_name.startswith("miui_")
+
+
 def fetch_hyperdata_versions(core, code):
     """返回某机型的版本列表 [(label, url, branch_name, release_date), ...]
 
@@ -1088,7 +1100,10 @@ def fetch_hyperdata_versions(core, code):
             os_version = rom.get("os", "")
             recovery = rom.get("recovery", "")
             url = _hyperdata_direct_url(os_version, recovery)
-            if not url or "ota_full" not in url.lower():
+            if not url:
+                continue
+            # 卡刷包两种命名都要（小米13 这类机型澎湃/MIUI 都有）
+            if not is_flashable_ota(url):
                 continue
             release = rom.get("release", "")
             label = "%s %s" % (os_version, ("(%s)" % release) if release else "")
@@ -1200,12 +1215,8 @@ def parse_xiaomi_direct_links(html_text):
         url = url.rstrip(";,.)")
         if not is_xiaomi_url(url) or url in seen:
             continue
-        file_name = url.rsplit("/", 1)[-1].lower()
-        # 只要"卡刷/完整 OTA"包：HyperOS 是 *_ota_full-*.zip，
-        # MIUI 老版本是 miui_XXX.zip；排除 *_images_*.tgz 线刷包
-        if "ota_full" not in file_name and not file_name.startswith("miui_"):
-            continue
-        if "_images_" in file_name or file_name.endswith(".tgz"):
+        # 只要"卡刷/完整 OTA"包（HyperOS ota_full / MIUI miui_，排除线刷包）
+        if not is_flashable_ota(url):
             continue
         seen.add(url)
         host = urlsplit(url).hostname or ""
@@ -2077,6 +2088,22 @@ def run_selftest():
           and os_major("OS3.0.308.0.WNKCNXM") == 3
           and os_major("V14.0.12.0.TKICNXM") == -14
           and os_major("OS4...") > os_major("OS3...") > os_major("V14..."))
+    # 小米13 这类"澎湃+MIUI 都有"的机型：两种卡刷包命名都要认（v2.4.5）
+    check("MIUI miui_ 卡刷包可识别",
+          is_flashable_ota("https://bn.d.miui.com/OS1.0.24.7.28.DEV/"
+                           "miui_FUXI_OS1.0.24.7.28.DEV_3ef5aa0598_14.0.zip")
+          and is_flashable_ota("https://bn.d.miui.com/OS3.0.3.0/"
+                               "fuxi-ota_full-OS3.0.3.0.WNKCNXM-user-14.0.zip"))
+    check("线刷 images.tgz 被排除",
+          not is_flashable_ota("https://bn.d.miui.com/x/fuxi_images_14.0.tgz"))
+    # 机型筛选忽略空格：平板5pro 能匹配 "小米平板 5 Pro 5G"（v2.4.5）
+    def _filter_like(keyword, label):
+        k = re.sub(r"\s+", "", keyword.strip().lower())
+        return k in re.sub(r"\s+", "", label.lower())
+    check("筛选忽略空格(平板5pro)",
+          _filter_like("平板5pro", "小米平板 5 Pro 5G (enuma)")
+          and _filter_like("小米15", "小米 15 (dada)")
+          and not _filter_like("平板6", "小米平板 5 Pro"))
     # 四节点 URL 替换
     base_url = "https://bn.d.miui.com/OS3.0.308.0/x-ota_full-abc.zip"
     check("节点1 bigota", xiaomi_node_url(base_url, 0).startswith("https://bigota.d.miui.com/"))
@@ -2973,7 +3000,7 @@ def run_targeted_test(window, log_path):
     # 1. 改动的常量
     record("预加载深度=滑动窗口(2)", PREFETCH_DEPTH == 2,
            "DEPTH=%d WORKERS=%d" % (PREFETCH_DEPTH, PREFETCH_WORKERS))
-    record("版本号=2.4.4", APP_VERSION == "2.4.4", APP_VERSION)
+    record("版本号=2.4.5", APP_VERSION == "2.4.5", APP_VERSION)
 
     # 2. 删除的控件
     record("已删除『直接链接』单选", not hasattr(window, "radio_direct"))
@@ -3359,9 +3386,12 @@ def main():
             keyword = self.filter_edit.text().strip().lower()
             if not keyword:
                 return list(range(len(self.devices)))
+            # 归一化：去掉所有空白。这样"平板5pro"能匹配"小米平板 5 Pro 5G"，
+            # "小米15"能匹配"小米 15"，不受名字里空格影响。
+            key = re.sub(r"\s+", "", keyword)
             return [i for i, device in enumerate(self.devices)
-                    if keyword in ("%s %s %s" % (
-                        device[1], device[2], device[0])).lower()]
+                    if key in re.sub(r"\s+", "", ("%s %s %s" % (
+                        device[1], device[2], device[0])).lower())]
 
         def _refresh_devices(self, *_args):
             self.device_list.blockSignals(True)
@@ -3595,8 +3625,10 @@ def main():
             keyword = self.filter_edit.text().strip().lower()
             if not keyword:
                 return list(range(len(self.devices)))
+            key = re.sub(r"\s+", "", keyword)
             return [index for index, device in enumerate(self.devices)
-                    if keyword in ("%s %s" % (device["name"], device["codename"])).lower()]
+                    if key in re.sub(r"\s+", "", ("%s %s" % (
+                        device["name"], device["codename"])).lower())]
 
         def _refresh_devices(self, *_args):
             self.device_list.blockSignals(True)
